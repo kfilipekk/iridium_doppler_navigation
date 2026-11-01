@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-A 46.5 × 47.2 mm, 6-layer STM32H743 flight controller that navigates without GPS using the Doppler shift of Iridium satellites. It runs ArduPilot with a MatekH743-compatible pinout and also carries the avionics for a TVC rocket lander. Made by Krystian Filipek for my GNSS-denied drone and the Cambridge University Spaceflight Lander Challenge.
+A 46.5 × 47.2 mm, 6-layer STM32H743 flight controller that navigates without GPS using the Doppler shift of Iridium satellites. It runs ArduPilot with a MatekH743-compatible pinout. Made by Krystian Filipek for my GNSS-denied drone.
 
 <div align="center">
 
@@ -29,7 +29,7 @@ Optical flow and visual-inertial odometry drift without bound over long flights.
 | IMUs | ICM-45686 (SPI1) and ICM-42605 (SPI4) on a separate analogue 3.3 V rail, shared with the tuner |
 | Barometer | MS5611 on I2C2 |
 | Storage | W25Q128 flash for the orbit catalogue, microSD over SDIO |
-| Power | 3S-5S input, TVS and reverse-polarity protection, two 3 A LMR33630 bucks (limited by inductors L2/L5 to 1.6 A system, 2.1 A payload) and three 3.3 V LDOs |
+| Power | 3S-5S input, TVS and reverse-polarity protection, two 3 A LMR33630 bucks, run to 1.6 A (system) and 2.1 A (payload) by the inductors' rms ratings; L2/L5 saturate at 2.4/2.5 A, below the IC's 4.2 A current limit, so a hard short on a 5 V rail saturates the inductor first and three 3.3 V LDOs |
 | Connectors | Latching JST-GH on every cable port, two servo headers, MMCX, USB-C, TC2030 SWD pads |
 | Protection | ESD clamp on every cable-facing signal, series resistors on the motor, telemetry, current, lidar and servo lines |
 
@@ -43,9 +43,8 @@ In4.Cu: Split power planes (+5V, +5V_PAYLOAD, +3V3, VBAT)
 B.Cu:   IMUs, baro, both crystals, CAN, microSD, the underside connectors
 ```
 
-### Supported Platforms
-- **GNSS-denied Quadcopter** - 30.5 mm stack mount, DShot ESC on `J2`, optical flow on `J14`, lidar on `J11`, companion computer on `J21`, DroneCAN on `J6`
-- **TVC Rocket Lander** - two servo outputs (`J17`, `J23`) on the payload rail and 6-DoF logging to microSD
+### On the Drone
+30.5 mm stack mount, DShot ESC on `J2`, optical flow on `J14`, lidar on `J11`, companion computer on `J21`, DroneCAN on `J6`
 
 ### How It Compares
 | | NAVCORE-SoOP | SpeedyBee F405 V4 | Matek H743-SLIM V3 | Pixhawk 6C |
