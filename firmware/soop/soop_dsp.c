@@ -1,4 +1,7 @@
 //soop_dsp.c - Iridium simplex burst detection and carrier measurement
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC optimize ("O2")             //ArduPilot builds -Os; this is the H7's hot loop
+#endif
 #include "soop_dsp.h"
 #include "soop_signal.h"
 
@@ -23,9 +26,13 @@
 #define NBIN_CLIP      2.0f            //one frame can lift a bin's floor by at most this ratio
 //no simplex burst outlasts its slot: a tone that does is a spur, and is dropped
 #define MAX_TONE_FRAMES ((int)(2.0f * SOOP_MAX_BURST_S * FSD / SOOP_DSP_HOP))
+//the noise floor moves over seconds: its percentile is taken every NOISE_EVERY frames
+#define NOISE_EVERY    4
 
 static int ra_syn_ready;
 static void ra_syn_init(void);
+static uint8_t brev[N];                 //bit-reversed index
+typedef char soop_dsp_brev_fits[(N <= 256) ? 1 : -1];
 
 static float bessel_i0(float x)
 {
@@ -60,6 +67,13 @@ static void design_halfband(float *h2)
 void soop_dsp_init(soop_dsp_t *d)
 {
     memset(d, 0, sizeof(*d));
+    for (int i = 0, j = 0; i < N; i++) {
+        brev[i] = (uint8_t)j;
+        int bit = N >> 1;
+        for (; j & bit; bit >>= 1)
+            j ^= bit;
+        j ^= bit;
+    }
     design_halfband(d->h2);
     for (int n = 0; n < N; n++)
         d->win[n] = 0.5f - 0.5f * cosf(2.0f * PI_F * n / N);
@@ -104,26 +118,34 @@ void soop_dsp_set_lo(soop_dsp_t *d, double lo_offset_hz)
 
 static void fft(float *re, float *im, const float *cw, const float *sw)
 {
-    for (int i = 1, j = 0; i < N; i++) {
-        int bit = N >> 1;
-        for (; j & bit; bit >>= 1)
-            j ^= bit;
-        j ^= bit;
+    for (int i = 0; i < N; i++) {
+        const int j = brev[i];
         if (i < j) {
             float t = re[i]; re[i] = re[j]; re[j] = t;
             t = im[i]; im[i] = im[j]; im[j] = t;
         }
     }
-    for (int len = 2; len <= N; len <<= 1) {
-        int step = N / len;
+    //lengths 2 and 4 together: twiddles 1 and -j, so no multiplies
+    for (int i = 0; i < N; i += 4) {
+        const float ar = re[i] + re[i + 1], ai = im[i] + im[i + 1];
+        const float br = re[i] - re[i + 1], bi = im[i] - im[i + 1];
+        const float cr = re[i + 2] + re[i + 3], ci = im[i + 2] + im[i + 3];
+        const float dr = im[i + 2] - im[i + 3], di = re[i + 3] - re[i + 2];   //(x2 - x3)(-j)
+        re[i] = ar + cr;     im[i] = ai + ci;
+        re[i + 2] = ar - cr; im[i + 2] = ai - ci;
+        re[i + 1] = br + dr; im[i + 1] = bi + di;
+        re[i + 3] = br - dr; im[i + 3] = bi - di;
+    }
+    for (int len = 8; len <= N; len <<= 1) {
+        const int step = N / len, half = len / 2;
         for (int i = 0; i < N; i += len) {
-            for (int k = 0; k < len / 2; k++) {
-                float wr = cw[k * step], wi = -sw[k * step];
-                int a = i + k, b = a + len / 2;
-                float xr = re[b] * wr - im[b] * wi;
-                float xi = re[b] * wi + im[b] * wr;
-                re[b] = re[a] - xr; im[b] = im[a] - xi;
-                re[a] += xr;        im[a] += xi;
+            float *ra = re + i, *ia = im + i, *rb = re + i + half, *ib = im + i + half;
+            for (int k = 0; k < half; k++) {
+                const float wr = cw[k * step], wi = -sw[k * step];
+                const float xr = rb[k] * wr - ib[k] * wi;
+                const float xi = rb[k] * wi + ib[k] * wr;
+                rb[k] = ra[k] - xr; ib[k] = ia[k] - xi;
+                ra[k] += xr;        ia[k] += xi;
             }
         }
     }
@@ -479,21 +501,26 @@ static void frame(soop_dsp_t *d, uint64_t m0)
         im[n] = d->ring_q[k] * d->win[n];
     }
     fft(re, im, d->cosw, d->sinw);
-    for (int k = 0; k < N; k++) {
+    for (int k = 0; k < N; k++)
         p[k] = re[k] * re[k] + im[k] * im[k];
-        tmp[k] = p[k];
-    }
-    //noise: 30th percentile of an exponential is 0.357 x its mean
-    float q = select_k(tmp, N, (int)(0.3f * N)) / 0.3567f;
     if (!d->noise_init) {
+        //noise: 30th percentile of an exponential is 0.357 x its mean
+        memcpy(tmp, p, sizeof tmp);
+        const float q = select_k(tmp, N, (int)(0.3f * N)) / 0.3567f;
         d->noise = q;
         d->noise_init = 1;
         for (int k = 0; k < N; k++)
             d->nbin[k] = q;
     } else {
-        if (q < 4.0f * d->noise) d->noise += 0.02f * (q - d->noise);
-        for (int k = 0; k < N; k++)
-            d->nbin[k] += NBIN_ALPHA * (fminf(p[k], NBIN_CLIP * d->nbin[k]) - d->nbin[k]);
+        if (d->n_frames % NOISE_EVERY == 0) {
+            memcpy(tmp, p, sizeof tmp);
+            const float q = select_k(tmp, N, (int)(0.3f * N)) / 0.3567f;
+            //0.02 a frame, as NOISE_EVERY frames: 1 - 0.98^4
+            if (q < 4.0f * d->noise) d->noise += 0.0776f * (q - d->noise);
+            //the per-bin floors too, NOISE_EVERY times NBIN_ALPHA (they move over ~2000 frames)
+            for (int k = 0; k < N; k++)
+                d->nbin[k] += NOISE_EVERY * NBIN_ALPHA * (fminf(p[k], NBIN_CLIP * d->nbin[k]) - d->nbin[k]);
+        }
     }
     d->n_frames++;
 
@@ -603,44 +630,59 @@ size_t soop_dsp_push(soop_dsp_t *d, const int16_t *iq, size_t n, soop_burst_t *o
 {
     const int n2 = SOOP_DSP_H2TAPS, c2 = (SOOP_DSP_H2TAPS - 1) / 2;
     size_t n_out = 0;
+    //per-sample state held in registers for the block, written back at the end
+    float ph_c = d->ph_c, ph_s = d->ph_s;
+    const float nco_c = d->nco_c, nco_s = d->nco_s;
+    int p1 = d->p1, p2 = d->p2;
+    uint64_t n_in = d->n_in, n1 = d->n1;
+    float *h1i = d->h1i, *h1q = d->h1q, *h2i = d->h2i, *h2q = d->h2q;
+    const float *h2 = d->h2;
     for (size_t s = 0; s < n; s++) {
         float i = iq[2 * s], q = iq[2 * s + 1];
-        d->n_in++;
+        n_in++;
         //mix up by the LO offset: Ring Alert to 0 Hz
-        float mi = i * d->ph_c - q * d->ph_s;
-        float mq = i * d->ph_s + q * d->ph_c;
-        float pc = d->ph_c * d->nco_c - d->ph_s * d->nco_s;
-        d->ph_s = d->ph_c * d->nco_s + d->ph_s * d->nco_c;
-        d->ph_c = pc;
-        if (!(d->n_in & 255)) {                 //keep the phasor on the unit circle
-            float r = 1.0f / sqrtf(d->ph_c * d->ph_c + d->ph_s * d->ph_s);
-            d->ph_c *= r;
-            d->ph_s *= r;
+        float mi = i * ph_c - q * ph_s;
+        float mq = i * ph_s + q * ph_c;
+        float pc = ph_c * nco_c - ph_s * nco_s;
+        ph_s = ph_c * nco_s + ph_s * nco_c;
+        ph_c = pc;
+        if (!(n_in & 255)) {                    //keep the phasor on the unit circle
+            float r = 1.0f / sqrtf(ph_c * ph_c + ph_s * ph_s);
+            ph_c *= r;
+            ph_s *= r;
         }
-        d->h1i[d->p1] = d->h1i[d->p1 + 7] = mi;
-        d->h1q[d->p1] = d->h1q[d->p1 + 7] = mq;
-        d->p1 = (d->p1 + 1) % 7;
-        if (d->n_in & 1)
+        h1i[p1] = h1i[p1 + 7] = mi;
+        h1q[p1] = h1q[p1 + 7] = mq;
+        if (++p1 == 7)
+            p1 = 0;
+        if (n_in & 1)
             continue;
         //stage 1, [-1 0 9 16 9 0 -1]/32 over the last 7 inputs (oldest first)
-        const float *xi = &d->h1i[d->p1], *xq = &d->h1q[d->p1];
+        const float *xi = &h1i[p1], *xq = &h1q[p1];
         float ai = (16.0f * xi[3] + 9.0f * (xi[2] + xi[4]) - (xi[0] + xi[6])) * (1.0f / 32.0f);
         float aq = (16.0f * xq[3] + 9.0f * (xq[2] + xq[4]) - (xq[0] + xq[6])) * (1.0f / 32.0f);
-        d->h2i[d->p2] = d->h2i[d->p2 + n2] = ai;
-        d->h2q[d->p2] = d->h2q[d->p2 + n2] = aq;
-        d->p2 = (d->p2 + 1) % n2;
-        d->n1++;
-        if (d->n1 & 1)
+        h2i[p2] = h2i[p2 + n2] = ai;
+        h2q[p2] = h2q[p2 + n2] = aq;
+        if (++p2 == n2)
+            p2 = 0;
+        n1++;
+        if (n1 & 1)
             continue;
         //stage 2: symmetric pairs at odd offsets, plus the centre
-        const float *wi = &d->h2i[d->p2], *wq = &d->h2q[d->p2];
-        float yi = d->h2[(n2 + 1) / 2 - 1] * wi[c2], yq = d->h2[(n2 + 1) / 2 - 1] * wq[c2];
+        const float *wi = &h2i[p2], *wq = &h2q[p2];
+        float yi = h2[(n2 + 1) / 2 - 1] * wi[c2], yq = h2[(n2 + 1) / 2 - 1] * wq[c2];
         for (int k = 0; 2 * k + 1 <= c2; k++) {
-            yi += d->h2[k] * (wi[c2 - 2 * k - 1] + wi[c2 + 2 * k + 1]);
-            yq += d->h2[k] * (wq[c2 - 2 * k - 1] + wq[c2 + 2 * k + 1]);
+            yi += h2[k] * (wi[c2 - 2 * k - 1] + wi[c2 + 2 * k + 1]);
+            yq += h2[k] * (wq[c2 - 2 * k - 1] + wq[c2 + 2 * k + 1]);
         }
         size_t room = max_out - n_out;
         n_out += emit(d, yi, yq, out + n_out, room);
     }
+    d->ph_c = ph_c;
+    d->ph_s = ph_s;
+    d->p1 = p1;
+    d->p2 = p2;
+    d->n_in = n_in;
+    d->n1 = n1;
     return n_out;
 }
