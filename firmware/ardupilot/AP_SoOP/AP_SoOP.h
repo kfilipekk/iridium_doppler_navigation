@@ -35,6 +35,7 @@ private:
         float  temp_c;           //IMU die temperature, the TCXO's nearest thermometer
         float  ivn, ive, ivd;    //over the ground from flow and rangefinder: GPS can't drag it
         bool   ind_ok;
+        bool   still;            //disarmed with the IMU at rest: the velocity is zero
     };
     struct burst_t {
         double t;
@@ -85,6 +86,8 @@ private:
     double     _fs;
     double     _undulation;      //m, geoid above ellipsoid, from the GPS when it says
     float      _baro_offset;     //ellipsoidal height minus baro altitude, learnt on GPS
+    double     _still_since = -1;//board s the IMU came to rest, -1 while it moves
+    bool       _still;
     bool       _have_baro_offset;
     double     _last_fix_t, _last_status_t;
     uint32_t   _cpu_us, _bursts_s;

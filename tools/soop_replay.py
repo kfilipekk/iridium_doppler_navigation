@@ -22,6 +22,9 @@ SOOP = os.path.join(os.path.dirname(HERE), "firmware", "soop")
 sys.path.insert(0, HERE)
 import soop_solver as sol
 
+STILL_GYRO = 0.03       #rad/s, and
+STILL_ACC = 0.3         #m/s^2 off gravity, held for
+STILL_HOLD_S = 2.0      #as AP_SoOP's detector
 UNDULATION_M = 45.7     #EGM96 at Cambridge; the board logs MSL altitude, the filter wants WGS84
 J2000_JD = 2451545.0
 
@@ -31,19 +34,33 @@ def gps_good(g, hacc):
     return g.Status >= 3 and g.NSats >= 6 and hacc < 5.0 and g.GWk > 0
 
 
-def build_obs(path, out_path, deny=()):
+def build_obs(path, out_path, deny=(), still=True):
     from pymavlink import mavutil
     m = mavutil.mavlink_connection(path)
     lines, utc_day0 = [], None
-    hacc, baro_off, n = 99.0, None, dict(D=0, E=0, G=0, A=0)
+    hacc, baro_off, n = 99.0, None, dict(D=0, E=0, G=0, A=0, Z=0)
     last_e = last_a = -1.0
+    still_since, last_z, armed = None, -1.0, False
     while True:
-        x = m.recv_match(type=["GPS", "GPA", "BARO", "XKF1", "SOB"])
+        x = m.recv_match(type=["GPS", "GPA", "BARO", "XKF1", "SOB", "IMU", "ARM"])
         if x is None:
             break
         k = x.get_type()
         t = x.TimeUS / 1e6
-        if k == "GPA" and x.I == 0:
+        if k == "ARM":
+            armed = bool(x.ArmState)
+        elif k == "IMU" and x.I == 0 and still:
+            gyro = math.sqrt(x.GyrX ** 2 + x.GyrY ** 2 + x.GyrZ ** 2)
+            acc = math.sqrt(x.AccX ** 2 + x.AccY ** 2 + x.AccZ ** 2)
+            if armed or gyro > STILL_GYRO or abs(acc - 9.80665) > STILL_ACC:
+                still_since = None
+            elif still_since is None:
+                still_since = t
+            elif t - still_since >= STILL_HOLD_S and t - last_z >= 0.5:
+                lines.append((t, "Z %.6f" % t))
+                last_z = t
+                n["Z"] += 1
+        elif k == "GPA" and x.I == 0:
             hacc = x.HAcc
         elif k == "GPS" and x.I == 0 and x.GWk > 0:
             #GPS time -> UTC seconds since J2000 (18 leap seconds since 2017)

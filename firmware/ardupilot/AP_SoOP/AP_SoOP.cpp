@@ -29,6 +29,14 @@ extern const AP_HAL::HAL& hal;
 //ArduPilot compiles with -fsingle-precision-constant
 static const uint64_t UNIX_J2000_US = 946728000ULL * 1000000ULL;   //12:00 UTC
 static const uint64_t GPS_UNIX_S = 315964800ULL;                     //1980-01-06 00:00 UTC
+//at rest: the IMU this quiet for this long. An IMU cannot tell rest from steady cruise, so
+//it only counts disarmed
+static const float STILL_GYRO = 0.03f;      //rad/s
+static const float STILL_ACC = 0.3f;        //m/s/s off gravity
+static const double STILL_HOLD_S = 2.0;
+//a u-blox stamps a fix when its message arrives: the navigation measured 75 +- 3 ms against
+//Iridium at Castle Mound (2026-11-16), and a blind start needs it set
+static const double GPS_LAG_S = 0.075;
 static const uint32_t LEAP_S = 18;                                   //GPS - UTC since 2017
 static const char *SOOP_DIR = "APM/SOOP";
 
@@ -71,6 +79,18 @@ void AP_SoOP::update()
     veh_t v {};
     v.t = AP_HAL::micros64() / double(1000000);
     v.armed = hal.util->get_soft_armed();
+    {
+        const AP_InertialSensor &ins = AP::ins();
+        const bool rest = !v.armed && ins.get_gyro().length() < STILL_GYRO
+                          && fabsf(ins.get_accel().length() - GRAVITY_MSS) < STILL_ACC;
+        if (!rest) {
+            _still_since = -1;
+        } else if (_still_since < 0) {
+            _still_since = v.t;
+        }
+        v.still = rest && v.t - _still_since >= STILL_HOLD_S;
+        _still = v.still;
+    }
 
     Vector3f vel;
     const AP_AHRS &ahrs = AP::ahrs();
@@ -223,6 +243,7 @@ void AP_SoOP::load_config()
         { "guard_k", &_gcfg.k }, { "guard_floor_m", &_gcfg.floor_m },
         { "guard_hold_s", &_gcfg.hold_s }, { "guard_free_vel", &_gcfg.free_vel_sigma },
         { "ind_vel_sigma", &_gcfg.ind_vel_sigma },
+        { "gps_lag_s", &c.gps_lag_s }, { "still_sigma", &c.still_sigma },
     };
     //no scanf here: ArduPilot's C library has none with floating point
     char *save = nullptr;
@@ -325,6 +346,7 @@ bool AP_SoOP::setup()
     _nav->cfg = cfg;
     soop_guard_default_cfg(&_gcfg);
     _lo_off = SOOP_LO_OFFSET_HZ;
+    _nav->cfg.gps_lag_s = GPS_LAG_S;
     load_config();
     soop_dsp_set_lo(_dsp, _lo_off);
     cfg = _nav->cfg;
@@ -514,6 +536,9 @@ void AP_SoOP::feed_until(double horizon)
         _was_armed = v.armed;
         if (v.vel_ok) {
             soop_guard_velocity(_guard, v.t, v.vn, v.ve, v.vd);
+            if (v.still) {
+                soop_guard_still(_guard, v.t);
+            }
         }
         if (v.ind_ok) {
             soop_guard_velocity_ind(_guard, v.t, v.ivn, v.ive, v.ivd);
@@ -544,11 +569,12 @@ void AP_SoOP::publish(double t)
     }
     soop_fix_t f;
     const bool valid = soop_guard_fix(_guard, t, &f);
-    AP::logger().WriteStreaming("SOF", "TimeUS,Lat,Lng,Alt,HAcc,VAcc,SAcc,NIS,NT,V",
-                                "QLLfffffBB", AP_HAL::micros64(),        //NIS is a float
+    //a log format holds at most 16 fields, and SOS has them: the still flag lives here
+    AP::logger().WriteStreaming("SOF", "TimeUS,Lat,Lng,Alt,HAcc,VAcc,SAcc,NIS,NT,V,St",
+                                "QLLfffffBBB", AP_HAL::micros64(),       //NIS is a float
                                 int32_t(f.lat_deg * 10000000), int32_t(f.lon_deg * 10000000),
                                 float(f.h_m - _undulation), f.hacc_m, f.vacc_m, f.sacc_ms, f.nis,
-                                f.n_track, f.valid);
+                                f.n_track, f.valid, uint8_t(_still));
     if (!valid || !_nav->have_time) {
         return;
     }

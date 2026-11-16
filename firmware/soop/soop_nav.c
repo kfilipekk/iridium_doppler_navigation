@@ -45,6 +45,8 @@ void soop_nav_default_cfg(soop_nav_cfg_t *c)
     c->fix_max_hacc = 3000.0;
     c->dut1 = 0.0;
     c->f_lo = SOOP_F_RING_ALERT + SOOP_LO_OFFSET_HZ;
+    c->gps_lag_s = 0.0;
+    c->still_sigma = 0.02; c->still_min_dt = 0.5;
 }
 
 //geometry
@@ -215,7 +217,7 @@ void soop_nav_init(soop_nav_t *nav, const soop_nav_cfg_t *cfg, const soop_sat_t 
     nav->cat = cat;
     nav->n_cat = n_cat < (int)sizeof nav->cat_ok ? n_cat : (int)sizeof nav->cat_ok;
     screen_catalogue(nav, t_now_utc);
-    nav->last_gps = nav->last_baro = nav->last_fused = -1e9;
+    nav->last_gps = nav->last_baro = nav->last_fused = nav->last_still = -1e9;
     nav->vis_t = -1e9;
     nav->nis_avg = 1.0;
 }
@@ -378,7 +380,7 @@ static void kalman(soop_nav_t *nav, const hrow_t *h, double y, double r2)
 
 void soop_nav_gps(soop_nav_t *nav, double t_board, double t_utc, const double ecef[3])
 {
-    time_sample(nav, t_board, t_utc);
+    time_sample(nav, t_board, t_utc + nav->cfg.gps_lag_s);
     nav->gps_valid = 1;
     if (!nav->have_pos) {
         base_init(nav, ecef, 10.0, t_board);
@@ -411,6 +413,24 @@ void soop_nav_baro(soop_nav_t *nav, double t_board, double h_m)
         hrow_add(&h, IP + i, -R[i][2]);          //up = -down
     hrow_add(&h, IBB, 1.0);
     kalman(nav, &h, h_m - (hh + nav->x[IBB]), nav->cfg.baro_sigma * nav->cfg.baro_sigma);
+}
+
+void soop_nav_still(soop_nav_t *nav, double t_board)
+{
+    //the true velocity is the flight EKF's plus its error, and it is zero: the error is
+    //minus the EKF's. Rate-limited, since successive samples of a still vehicle are not
+    //independent evidence
+    if (!nav->have_pos || t_board - nav->last_still < nav->cfg.still_min_dt)
+        return;
+    nav->last_still = t_board;
+    propagate_to(nav, t_board);
+    double v[3];
+    vel_at(nav, t_board, v);
+    for (int k = 0; k < 3; k++) {
+        hrow_t h = { 0, {0}, {0} };
+        hrow_add(&h, IV + k, 1.0);
+        kalman(nav, &h, -v[k] - nav->x[IV + k], nav->cfg.still_sigma * nav->cfg.still_sigma);
+    }
 }
 
 //satellites

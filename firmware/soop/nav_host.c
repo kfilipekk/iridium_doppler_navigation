@@ -125,6 +125,8 @@ int main(int argc, char **argv)
                 {"sig_floor", &cfg.sig_floor}, {"gate", &cfg.gate}, {"mask_deg", &cfg.mask_deg},
                 {"max_tle_age_d", &cfg.max_tle_age_d}, {"fix_max_hacc", &cfg.fix_max_hacc},
                 {"gps_sigma", &cfg.gps_sigma}, {"dut1", &cfg.dut1}, {"amb_ratio", &cfg.amb_ratio},
+                {"dt_sigma0", &cfg.dt_sigma0}, {"gps_lag_s", &cfg.gps_lag_s},
+                {"still_sigma", &cfg.still_sigma},
             };
             char key[32];
             double val;
@@ -167,7 +169,7 @@ int main(int argc, char **argv)
                 utc0 = soop_jd_to_j2000(a, b);
             continue;
         }
-        if (!strchr("EIAGDPUR", line[0]) || sscanf(line + 1, "%lf", &t) != 1)
+        if (!strchr("EIAGDPURZ", line[0]) || sscanf(line + 1, "%lf", &t) != 1)
             continue;
         if (next_fix < 0.0)
             next_fix = t;
@@ -219,6 +221,9 @@ int main(int argc, char **argv)
         case 'R':
             soop_guard_arm(&guard, t);
             break;
+        case 'Z':
+            soop_guard_still(&guard, t);
+            break;
         case 'D': {
             int sv = -1;
             if (sscanf(line + 1, "%lf %lf %lf %lf %d", &t, &a, &b, &d, &sv) >= 4) {
@@ -255,5 +260,6 @@ int main(int argc, char **argv)
             aid_in, aid_fused, aid_fused ? (double)aid_windows / aid_fused : 0.0);
     fprintf(stderr, "clock %.1f Hz (sd %.1f), from a prior %d, prior kept %d\n", nav_->x[6],
             sqrt(nav_->P[6][6]), nav_->clk_from_prior, nav_->clk_prior_set);
+    fprintf(stderr, "time tag %.1f ms (sd %.1f)\n", 1e3 * nav_->x[8], 1e3 * sqrt(nav_->P[8][8]));
     return 0;
 }

@@ -53,6 +53,9 @@ typedef struct {
     double fix_max_hacc;             //m
     double dut1;                     //UT1-UTC, s
     double f_lo;                     //the tuner's LO, Hz (Ring Alert + the LO offset)
+    double gps_lag_s;                //added to every GPS time tag: the receiver stamps a fix
+                                     //when its message arrives, after the epoch it is for
+    double still_sigma, still_min_dt;//zero-velocity update while the vehicle is still: m/s, s
 } soop_nav_cfg_t;
 
 typedef struct {
@@ -110,7 +113,7 @@ typedef struct {
     soop_acq_t acq[SOOP_NAV_ACQ_MAX];
     int    n_acq;
 
-    double last_gps, last_baro, last_fused;
+    double last_gps, last_baro, last_fused, last_still;
     int    last_sat, last_ch;        //the last fused burst: NORAD number, channel 0-4
     double last_y, last_sd;          //and its innovation, Hz
     double nis_avg;
@@ -155,6 +158,8 @@ void soop_nav_gps(soop_nav_t *nav, double t_board, double t_utc, const double ec
 
 //ellipsoidal height from the baro (the caller ties baro to GPS height while it has it)
 void soop_nav_baro(soop_nav_t *nav, double t_board, double h_m);
+//the vehicle is not moving (disarmed, IMU still): its true velocity is zero
+void soop_nav_still(soop_nav_t *nav, double t_board);
 
 //a known position without GPS (bench, or a surveyed pad)
 void soop_nav_set_position(soop_nav_t *nav, double t_board, const double ecef[3], double sigma_m);
