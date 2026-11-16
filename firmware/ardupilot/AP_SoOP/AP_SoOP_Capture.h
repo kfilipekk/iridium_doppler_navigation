@@ -24,6 +24,7 @@ public:
     uint64_t start_us() const { return _start_us; }      //board time of sample 0
     uint32_t overruns() const { return _overruns; }
     uint32_t adc_errors() const;                          //ADC overruns the DMA missed
+    double measured_hz() const;                           //complex samples/s since the first block
 
 private:
     uint64_t _start_us;

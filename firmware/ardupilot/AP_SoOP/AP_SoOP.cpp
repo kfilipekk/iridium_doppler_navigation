@@ -82,9 +82,13 @@ void AP_SoOP::update()
     //the real GPS, only while it is good enough to calibrate against
     const AP_GPS &gps = AP::gps();
     float hacc = 99.0f, und = 0.0f;
+    //a u-blox can report a 3D fix before it knows the week; time_epoch_usec is 0 until it does,
+    //and 0 - UNIX_J2000_US wraps, which put UTC millions of years out and every TLE stale
+    const uint64_t gps_us = gps.time_epoch_usec(0);
     const bool good = _guard_state != SOOP_G_SPOOFED
                       && gps.status(0) >= AP_GPS::GPS_OK_FIX_3D && gps.num_sats(0) >= 6
-                      && gps.horizontal_accuracy(0, hacc) && hacc < 5.0f;
+                      && gps.horizontal_accuracy(0, hacc) && hacc < 5.0f
+                      && gps_us > UNIX_J2000_US;
     if (good) {
         if (gps.get_undulation(0, und)) {
             _undulation = und;
@@ -92,7 +96,7 @@ void AP_SoOP::update()
         const Location &loc = gps.location(0);
         const double h = loc.alt / double(100) + _undulation;
         soop_ecef(loc.lat / double(10000000), loc.lng / double(10000000), h, v.gps_ecef);
-        v.gps_utc = (gps.time_epoch_usec(0) - UNIX_J2000_US) / double(1000000);
+        v.gps_utc = (gps_us - UNIX_J2000_US) / double(1000000);
         v.gps_ok = true;
         const float b = AP::baro().get_altitude();
         const float off = h - b;                    //baro is relative: tie it to the GPS
@@ -350,6 +354,14 @@ bool AP_SoOP::setup()
         _capturing = true;
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SoOP: tuner locked, VCO %u, %d satellites",
                       tuner.vco(), _n_cat);
+        //an ADC that drops triggers raises no error, it just runs slow: every frequency the DSP
+        //reads is then scaled by the ratio, so say so rather than search the wrong band
+        hal.scheduler->delay(200);
+        const double fs_hz = capture.measured_hz();
+        if (fabs(fs_hz / SOOP_FS - 1.0) > 0.01) {
+            GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "SoOP: I/Q at %.0f kSPS, the DSP expects %.0f",
+                          fs_hz / 1000.0, SOOP_FS / 1000.0);
+        }
     }
     soop_guard_init(_guard, &cfg, &_gcfg, _cat, _n_cat, 0.0);
     clock_load(AP::ins().get_temperature(0));
@@ -533,7 +545,7 @@ void AP_SoOP::publish(double t)
     soop_fix_t f;
     const bool valid = soop_guard_fix(_guard, t, &f);
     AP::logger().WriteStreaming("SOF", "TimeUS,Lat,Lng,Alt,HAcc,VAcc,SAcc,NIS,NT,V",
-                                "QLLffffBB" "B", AP_HAL::micros64(),
+                                "QLLfffffBB", AP_HAL::micros64(),        //NIS is a float
                                 int32_t(f.lat_deg * 10000000), int32_t(f.lon_deg * 10000000),
                                 float(f.h_m - _undulation), f.hacc_m, f.vacc_m, f.sacc_ms, f.nis,
                                 f.n_track, f.valid);
