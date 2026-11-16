@@ -76,6 +76,14 @@ void soop_guard_baro(soop_guard_t *g, double t, double h_m)
         soop_nav_baro(&g->free, t, h_m);
 }
 
+void soop_guard_still(soop_guard_t *g, double t)
+{
+    //an IMU at rest is not something a GPS spoofer can move, so free takes it too
+    soop_nav_still(&g->main, t);
+    if (FREE_RUNS(g))
+        soop_nav_still(&g->free, t);
+}
+
 void soop_guard_set_position(soop_guard_t *g, double t, const double ecef[3], double sigma_m)
 {
     soop_nav_set_position(&g->main, t, ecef, sigma_m);

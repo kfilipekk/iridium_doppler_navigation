@@ -23,6 +23,7 @@ extern const AP_HAL::HAL& hal;
 static adcsample_t *buf;                    //2 x SOOP_CAPTURE_BLOCK 32-bit words, DMA-safe
 static volatile uint32_t halves_done;       //half-buffers completed since start
 static volatile uint64_t first_half_us;
+static volatile uint64_t last_half_us;
 static volatile uint32_t adc_errors_n;
 static binary_semaphore_t ready;
 static ADCConversionGroup grp;
@@ -30,9 +31,11 @@ static ADCConversionGroup grp;
 static void end_cb(ADCDriver *adcp)
 {
     (void)adcp;
+    const uint64_t now = AP_HAL::micros64();
     if (halves_done == 0) {
-        first_half_us = AP_HAL::micros64();
+        first_half_us = now;
     }
+    last_half_us = now;
     halves_done++;
     chSysLockFromISR();
     chBSemSignalI(&ready);
@@ -75,10 +78,13 @@ bool AP_SoOP_Capture::start(bool swap_iq)
               | (uint32_t(__builtin_ctz(SOOP_CAPTURE_OVS)) << ADC_CFGR2_OVSS_Pos);
     grp.ccr = ADC_CCR_DUAL_REG_SIMULT;
     grp.pcsel = (1U << 4) | (1U << 18);
-    //16.5 + 8.5 cycles at the 32 MHz ADC clock is 0.78 us of the 1 us raw period
-    grp.smpr[0] = ADC_SMPR1_SMP_AN4(ADC_SMPR_SMP_16P5);
+    //PLL3_R gives the ADC 32 MHz, but revision V silicon halves it: 16 MHz. 16.5 + 8.5 cycles
+    //was 1.56 us, so every other 1 us trigger fell mid-conversion and was dropped without an
+    //error - 250 kSPS, every frequency read double. 2.5 + 8.5 cycles is 0.69 us at 16 MHz. The
+    //1 nF at each pin (C100/C101) feeds the sample cap, and its 680R refills it between samples
+    grp.smpr[0] = ADC_SMPR1_SMP_AN4(ADC_SMPR_SMP_2P5);
     grp.sqr[0] = ADC_SQR1_SQ1_N(ADC_CHANNEL_IN4);            //ADC1: PC4, I
-    grp.ssmpr[1] = ADC_SMPR2_SMP_AN18(ADC_SMPR_SMP_16P5);
+    grp.ssmpr[1] = ADC_SMPR2_SMP_AN18(ADC_SMPR_SMP_2P5);
     grp.ssqr[0] = ADC_SQR1_SQ1_N(ADC_CHANNEL_IN18);          //ADC2: PA4, Q
 
     adcStart(&ADCD1, nullptr);
@@ -107,6 +113,15 @@ bool AP_SoOP_Capture::start(bool swap_iq)
     const double fs = double(STM32_TIMCLK1) / (TIM6->ARR + 1U) / SOOP_CAPTURE_OVS;
     _start_us = first_half_us - uint64_t(SOOP_CAPTURE_BLOCK * double(1000000) / fs);
     return true;
+}
+
+double AP_SoOP_Capture::measured_hz() const
+{
+    //half-buffers between the first and the latest, over the time between their interrupts: the
+    //rate the ADC really ran at, with no partial block at either end
+    const uint32_t n = halves_done;
+    const uint64_t dt = last_half_us - first_half_us;
+    return (n > 1 && dt > 0) ? (n - 1) * double(SOOP_CAPTURE_BLOCK) * 1e6 / dt : 0.0;
 }
 
 void AP_SoOP_Capture::stop()
@@ -154,5 +169,6 @@ bool AP_SoOP_Capture::start(bool) { return false; }
 void AP_SoOP_Capture::stop() {}
 bool AP_SoOP_Capture::next_block(int16_t *, uint64_t &, uint32_t) { return false; }
 uint32_t AP_SoOP_Capture::adc_errors() const { return 0; }
+double AP_SoOP_Capture::measured_hz() const { return 0.0; }
 
 #endif

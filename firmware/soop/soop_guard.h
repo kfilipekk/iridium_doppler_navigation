@@ -49,6 +49,7 @@ void soop_guard_velocity_ind(soop_guard_t *g, double t_board, float vn, float ve
 int  soop_flow_velocity(const float r[9], float comp_x, float comp_y, float range, float vd,
                         float v_ned[3]);
 void soop_guard_baro(soop_guard_t *g, double t_board, double h_m);
+void soop_guard_still(soop_guard_t *g, double t_board);
 void soop_guard_set_position(soop_guard_t *g, double t_board, const double ecef[3],
                              double sigma_m);
 void soop_guard_set_time(soop_guard_t *g, double t_board, double t_utc);
