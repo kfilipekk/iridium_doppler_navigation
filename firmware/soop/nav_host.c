@@ -116,6 +116,35 @@ int main(int argc, char **argv)
             prior = atof(argv[k + 1]);
             prior_sd = atof(argv[k + 2]);
             k += 2;
+        } else if (!strcmp(argv[k], "--cfg") && k + 1 < argc) {
+            //key=value over the navigation's settings, for replaying a log with one changed
+            const struct { const char *key; double *val; } keys[] = {
+                {"vel_sigma", &cfg.vel_sigma}, {"vel_tau", &cfg.vel_tau},
+                {"velz_sigma", &cfg.velz_sigma}, {"clk_q", &cfg.clk_q}, {"clkd_q", &cfg.clkd_q},
+                {"clk_sigma_acq", &cfg.clk_sigma_acq}, {"beta_sigma", &cfg.beta_sigma},
+                {"sig_floor", &cfg.sig_floor}, {"gate", &cfg.gate}, {"mask_deg", &cfg.mask_deg},
+                {"max_tle_age_d", &cfg.max_tle_age_d}, {"fix_max_hacc", &cfg.fix_max_hacc},
+                {"gps_sigma", &cfg.gps_sigma}, {"dut1", &cfg.dut1}, {"amb_ratio", &cfg.amb_ratio},
+            };
+            char key[32];
+            double val;
+            const char *arg = argv[++k];
+            const char *eq = strchr(arg, '=');
+            int found = 0;
+            if (eq && (size_t)(eq - arg) < sizeof key) {
+                memcpy(key, arg, eq - arg);
+                key[eq - arg] = 0;
+                val = atof(eq + 1);
+                for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++)
+                    if (!strcmp(key, keys[i].key)) {
+                        *keys[i].val = val;
+                        found = 1;
+                    }
+            }
+            if (!found) {
+                fprintf(stderr, "unknown --cfg %s\n", arg);
+                return 1;
+            }
         }
     }
     soop_guard_cfg_t gcfg;
