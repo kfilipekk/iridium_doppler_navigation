@@ -2,6 +2,7 @@
 #pragma once
 
 #include <AP_HAL/AP_HAL.h>
+#include "AP_SoOP_Capture.h"      //SOOP_CAPTURE_BLOCK
 
 extern "C" {
 #include "soop_ant.h"
@@ -36,6 +37,7 @@ private:
         float  ivn, ive, ivd;    //over the ground from flow and rangefinder: GPS can't drag it
         bool   ind_ok;
         bool   still;            //disarmed with the IMU at rest: the velocity is zero
+        bool   pps;              //gps_utc is from the PPS, exact: no lag to add
     };
     struct burst_t {
         double t;
@@ -53,7 +55,13 @@ private:
     void log_status(double t);
     void ant_update(double t);
     void led_tick();
+    void pps_isr(uint8_t pin, bool high, uint32_t t_us);
     void iq_record(const int16_t *iq, uint64_t first_sample);
+    void iq_writer();
+    bool iq_setup();
+    struct iq_slot_t;
+    iq_slot_t *iq_claim(uint8_t **data);
+    void iq_commit();
     void clock_load(float temp_c);
     void clock_learn(float temp_c);
     void clock_save(double t);
@@ -64,6 +72,9 @@ private:
     bool     _leds;
     uint8_t  _led_n;
     volatile uint32_t _fused_ms;
+    volatile uint32_t _heard_ms;  //the DSP's last burst, matched or not
+    volatile uint8_t _gps_stage;  //0 no u-blox fix, 1 a fix not yet good enough, 2 good
+    volatile uint8_t _stage;      //green's start-up count, 0-3
     HAL_Semaphore _sem;
     veh_t    _veh[AP_SOOP_VEH_QUEUE];
     uint16_t _veh_head, _veh_tail;
@@ -116,11 +127,32 @@ private:
     uint8_t    _start_keys;      //which of start_lat, start_lon, start_h were given
     bool       _start_done;
     bool       _no_still;        //soop.cfg still 0: a vehicle that cruises disarmed (an airliner)
+    //the u-blox's PPS on TP3 (PB9, GPIO 54; SERVO5_FUNCTION -1), soop.cfg pps 1: each rising
+    //edge, stamped in its interrupt, is a whole UTC second
+    bool       _pps, _pps_armed;
+    volatile uint32_t _pps_edge_us, _pps_edges;
+    uint32_t   _pps_used;        //edges already paired with a second
+    double     _pps_tb, _pps_utc;//the last paired edge: board s, UTC s since J2000
     //raw I/Q snippets: iq_rec_s seconds every iq_every_s (soop.cfg; 0 = off)
     double     _iq_rec_s, _iq_every_s, _iq_next_t;
-    int        _iq_fd = -1;
-    uint32_t   _iq_left;         //blocks still to write in this snippet
+    uint32_t   _iq_left;         //blocks still to queue in this recording
+    bool       _iq_open, _iq_close_pending;
+    //the ring between the capture thread, which fills it, and iq_writer, which alone touches
+    //the card: a card stall waits there, never in the capture loop
+    iq_slot_t *_iq_slots;         //what the writer is to do, one a slot
+    uint8_t   *_iq_data;          //each slot's record, back to back, so a run of DATA slots is
+                                  //one contiguous write
+    uint32_t   _iq_rec_bytes, _iq_nslots;
+    volatile uint32_t _iq_head, _iq_tail;
+    uint32_t   _iq_dropped, _iq_written; //blocks the ring had no room for; blocks written
+    int        _iq_fd = -1;      //the writer's
+    bool       _iq_skip;         //the writer's: this recording found the card too full
+    uint32_t   _iq_since_sync;
     int16_t    _iq_n = -1;       //file number, -1 until the first free one is found
+    uint8_t    _iq_bits = 4;     //4: soop_iq4 records (.iq4), 16: raw int16 (.bin)
+    double     _iq_fast_mps;     //continuous while the u-blox has seen this speed (0: off)
+    bool       _iq_fast;         //latched: seen over iq_fast_mps, not yet under half of it
+    volatile float _gps_spd;     //the u-blox's ground speed when last good, m/s
     volatile uint32_t _gps_good_ms; //when the u-blox last passed the 'good' test
     uint64_t   _samples_s;
     //the TCXO's offset per degree, remembered across flights in clock.dat

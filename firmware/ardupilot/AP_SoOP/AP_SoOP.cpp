@@ -4,6 +4,7 @@
 
 extern "C" {
 #include "soop_signal.h"
+#include "soop_iq4.h"
 }
 
 #include <AP_AHRS/AP_AHRS.h>
@@ -40,6 +41,9 @@ static const float STILL_GPS_SPD = 1.0f;    //m/s: the u-blox reads up to 0.65 a
 static const float MOVING_SPD = 3.0f;       //m/s: past this the u-blox has seen it move
 static const double STILL_HOLD_S = 2.0;
 static const uint32_t BARO_FRESH_MS = 30000;//time only: a cabin's baro, tied to the u-blox
+static const uint8_t PPS_PIN = 54;           //TP3, PB9 (PWM5): SERVO5_FUNCTION -1
+static const double PPS_HOLD_S = 1.5;        //a pairing serves until the next edge is due
+static const uint32_t IQ_SYNC_BLOCKS = 1221; //~10 s of capture blocks between I/Q fsyncs
 //a u-blox stamps a fix when its message arrives: the navigation measured 75 +- 3 ms against
 //Iridium at Castle Mound (2026-11-16), and a blind start needs it set
 static const double GPS_LAG_S = 0.075;
@@ -52,6 +56,9 @@ static const uint8_t LED_BLUE = HAL_GPIO_B_LED_PIN, LED_GREEN = HAL_GPIO_A_LED_P
 #endif
 static const uint8_t BLUE_ON_OF = 8;     //1 ms in 8 from the 1 kHz timer: dim, no flicker
 static const uint32_t GREEN_MS = 60;     //green after each fused burst
+static const uint32_t HEARD_MS = 40;     //blue brighter after each burst the DSP detects
+static const uint8_t DIM_ON = 1, FLASH_ON = 3;   //ms on in BLUE_ON_OF: both LEDs stay dim
+static const uint32_t STAGE_MS = 4000, STAGE_GAP_MS = 400;   //green's start-up count
 
 static AP_SoOP_MAX2112 tuner;
 static AP_SoOP_Capture capture;
@@ -101,6 +108,16 @@ void AP_SoOP::update()
         }
     }
 
+    if (_pps && !_pps_armed) {
+        _pps_armed = true;
+        hal.gpio->pinMode(PPS_PIN, HAL_GPIO_INPUT);
+        if (!hal.gpio->attach_interrupt(PPS_PIN,
+                FUNCTOR_BIND_MEMBER(&AP_SoOP::pps_isr, void, uint8_t, bool, uint32_t),
+                AP_HAL::GPIO::INTERRUPT_RISING)) {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SoOP: no PPS interrupt on TP3 (SERVO5_FUNCTION -1?)");
+        }
+    }
+
     veh_t v {};
     v.t = AP_HAL::micros64() / double(1000000);
     v.armed = hal.util->get_soft_armed();
@@ -122,6 +139,7 @@ void AP_SoOP::update()
                       && gps.status(0) >= AP_GPS::GPS_OK_FIX_3D && gps.num_sats(0) >= 6
                       && gps.horizontal_accuracy(0, hacc) && hacc < 5.0f
                       && gps_us > UNIX_J2000_US;
+    _gps_stage = good ? 2 : gps.status(0) >= AP_GPS::GPS_OK_FIX_3D ? 1 : 0;
     if (good) {
         if (gps.get_undulation(0, und)) {
             _undulation = und;
@@ -130,8 +148,28 @@ void AP_SoOP::update()
         const double h = loc.alt / double(100) + _undulation;
         soop_ecef(loc.lat / double(10000000), loc.lng / double(10000000), h, v.gps_ecef);
         v.gps_utc = (gps_us - UNIX_J2000_US) / double(1000000);
+        const uint32_t edges = _pps_edges;
+        if (_pps && edges != _pps_used) {
+            //the edge's board time: its 32-bit stamp, unwrapped against now
+            const uint64_t now_us = AP_HAL::micros64();
+            const uint64_t edge_us = now_us - uint32_t(uint32_t(now_us) - _pps_edge_us);
+            const double tb = edge_us / double(1000000);
+            //the message's UTC, lag-corrected, back to the edge, is within ~0.1 s of it:
+            //the nearest whole second is the edge's (J2000 is 12:00:00, a whole second)
+            const double est = v.gps_utc + _nav->cfg.gps_lag_s - (v.t - tb);
+            _pps_tb = tb;
+            _pps_utc = floor(est + 0.5);
+            _pps_used = edges;
+            AP::logger().WriteStreaming("SOP", "TimeUS,Edge,UTC,Off", "QQdf", now_us, edge_us,
+                                        _pps_utc, float(est - _pps_utc));
+        }
+        if (_pps && _pps_tb > 0 && v.t - _pps_tb < PPS_HOLD_S) {
+            v.gps_utc = _pps_utc + (v.t - _pps_tb);
+            v.pps = true;
+        }
         v.gps_ok = true;
         _gps_good_ms = AP_HAL::millis();
+        _gps_spd = gps.ground_speed();
         const float b = AP::baro().get_altitude();
         const float off = h - b;                    //baro is relative: tie it to the GPS
         _baro_offset = _have_baro_offset ? 0.98f * _baro_offset + 0.02f * off : off;
@@ -214,6 +252,13 @@ void AP_SoOP::update()
     }
 }
 
+//the u-blox's timepulse: only the stamp, the pairing is done in update()
+void AP_SoOP::pps_isr(uint8_t pin, bool high, uint32_t t_us)
+{
+    _pps_edge_us = t_us;
+    _pps_edges++;
+}
+
 //timer thread, 1 kHz
 void AP_SoOP::led_tick()
 {
@@ -221,8 +266,17 @@ void AP_SoOP::led_tick()
     if (++_led_n >= BLUE_ON_OF) {
         _led_n = 0;
     }
-    hal.gpio->write(LED_BLUE, _led_n != 0);
-    hal.gpio->write(LED_GREEN, AP_HAL::millis() - _fused_ms >= GREEN_MS);
+    //blue: dim and steady for power, a little brighter for a moment at each burst heard - no
+    //GPS or time needed, so it shows reception alone; more satellites, faster blinking.
+    //green: as dim a flash for each burst fused to a satellite, and every STAGE_MS a count of
+    //how far start-up has got (_stage blinks: 1 u-blox fix not yet good, 2 finding the clock,
+    //3 navigating). Low is on
+    const uint32_t now = AP_HAL::millis();
+    const uint8_t blue_on = now - _heard_ms < HEARD_MS ? FLASH_ON : DIM_ON;
+    const uint32_t ph = now % STAGE_MS;
+    const bool count = ph / STAGE_GAP_MS < _stage && ph % STAGE_GAP_MS < GREEN_MS;
+    hal.gpio->write(LED_BLUE, _led_n >= blue_on);
+    hal.gpio->write(LED_GREEN, !((count || now - _fused_ms < GREEN_MS) && _led_n < FLASH_ON));
 #endif
 }
 
@@ -353,10 +407,16 @@ void AP_SoOP::load_config()
             _start_sigma = val;
         } else if (!strcmp(key, "still")) {
             _no_still = is_zero(val);
+        } else if (!strcmp(key, "pps")) {
+            _pps = !is_zero(val);
         } else if (!strcmp(key, "iq_rec_s")) {
             _iq_rec_s = val;
         } else if (!strcmp(key, "iq_every_s")) {
             _iq_every_s = val;
+        } else if (!strcmp(key, "iq_bits")) {
+            _iq_bits = (val >= 16) ? 16 : 4;
+        } else if (!strcmp(key, "iq_fast_mps")) {
+            _iq_fast_mps = val;
         } else if (!strcmp(key, "bbg")) {
             _bbg = uint8_t(constrain_int16(int16_t(val), 0, 15));
         } else if (!strcmp(key, "lo_offset_hz")) {
@@ -498,6 +558,9 @@ void AP_SoOP::thread_main()
     if (!setup()) {
         return;
     }
+    if (!_replay) {
+        iq_setup();
+    }
     int fd = -1;
     uint64_t replay_sample = 0;
     if (_replay) {
@@ -544,46 +607,224 @@ void AP_SoOP::thread_main()
 //keeps of a burst is a few numbers, and the capture also holds the other simplex channels,
 //so a better DSP can run over these later (dsp_host, or soop.cfg replay). SOI logs each
 //file's first sample and its board time
+//a slot in the ring: what the writer is to do; a DATA slot's record is in _iq_data
+struct AP_SoOP::iq_slot_t {
+    uint8_t  kind;           //IQ_OPEN, IQ_DATA, IQ_CLOSE
+    uint8_t  bits;
+    uint64_t first_sample;   //OPEN: the recording's first sample, and its board time
+    double   t;
+};
+enum { IQ_OPEN = 1, IQ_DATA, IQ_CLOSE };
+static const uint32_t IQ_RING_KB[] = { 256, 192, 160, 128, 96, 64 };   //the largest that fits
+static const uint32_t IQ_RUN_MAX = 8;    //DATA slots merged into one write: ~32 KB, a cluster
+
+//capture thread: start the writer and its ring, if soop.cfg records at all
+bool AP_SoOP::iq_setup()
+{
+    if (_iq_rec_s <= 0 && _iq_fast_mps <= 0) {
+        return false;
+    }
+    _iq_rec_bytes = _iq_bits == 16 ? 4 * SOOP_CAPTURE_BLOCK : 4 + SOOP_CAPTURE_BLOCK;
+    for (uint32_t kb : IQ_RING_KB) {
+        const uint32_t n = kb * 1024 / (_iq_rec_bytes + sizeof(iq_slot_t));
+        if (n < 8) {
+            break;
+        }
+        _iq_data = (uint8_t *)malloc(size_t(n) * _iq_rec_bytes);
+        _iq_slots = (iq_slot_t *)calloc(n, sizeof(iq_slot_t));
+        if (_iq_data && _iq_slots) {
+            _iq_nslots = n;
+            break;
+        }
+        free(_iq_data);
+        free(_iq_slots);
+        _iq_data = nullptr;
+        _iq_slots = nullptr;
+    }
+    if (!_iq_slots || !hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_SoOP::iq_writer, void),
+                                                    "SoOPiq", 4096, AP_HAL::Scheduler::PRIORITY_IO, 0)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SoOP: no I/Q recording (no memory or thread)");
+        free(_iq_data);
+        free(_iq_slots);
+        _iq_data = nullptr;
+        _iq_slots = nullptr;
+        return false;
+    }
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SoOP: I/Q %u-bit, ring %u blocks (%.0f ms)", unsigned(_iq_bits),
+                  unsigned(_iq_nslots), _iq_nslots * SOOP_CAPTURE_BLOCK * 1000.0 / SOOP_FS);
+    return true;
+}
+
+//capture thread: the next free slot and its record space, or null when the writer is that
+//far behind
+AP_SoOP::iq_slot_t *AP_SoOP::iq_claim(uint8_t **data)
+{
+    const uint32_t next = (_iq_head + 1) % _iq_nslots;
+    if (next == _iq_tail) {
+        return nullptr;
+    }
+    if (data) {
+        *data = _iq_data + size_t(_iq_head) * _iq_rec_bytes;
+    }
+    return &_iq_slots[_iq_head];
+}
+
+void AP_SoOP::iq_commit()
+{
+    __sync_synchronize();                 //the slot's contents before the writer can see it
+    _iq_head = (_iq_head + 1) % _iq_nslots;
+}
+
+//capture thread: decide what to record and queue it; never touches the card
 void AP_SoOP::iq_record(const int16_t *iq, uint64_t first_sample)
 {
-    if (_iq_rec_s <= 0) {
+    if (!_iq_slots) {
         return;
     }
     const double t = _t0 + first_sample / _fs;
+    //continuous while fast (an airliner from its take-off roll): latched on the u-blox's speed
+    //and held through a window dropout until it reads under half of it again
+    if (_iq_fast_mps > 0 && AP_HAL::millis() - _gps_good_ms < 2000) {
+        if (_gps_spd > _iq_fast_mps) {
+            _iq_fast = true;
+        } else if (_gps_spd < 0.5 * _iq_fast_mps) {
+            _iq_fast = false;
+        }
+    }
+    iq_slot_t *s;
+    if (_iq_close_pending) {
+        if (!(s = iq_claim(nullptr))) {
+            return;
+        }
+        s->kind = IQ_CLOSE;
+        iq_commit();
+        _iq_close_pending = false;
+    }
+    if (!_iq_open) {
+        if (!_iq_fast && (_iq_rec_s <= 0 || t < _iq_next_t)) {
+            return;
+        }
+        if (!(s = iq_claim(nullptr))) {
+            return;                       //the writer is behind: start on a later block
+        }
+        if (!_iq_fast) {
+            _iq_next_t = t + (_iq_every_s > 0 ? _iq_every_s : 300.0);
+        }
+        s->kind = IQ_OPEN;
+        s->bits = _iq_bits;
+        s->first_sample = first_sample;
+        s->t = t;
+        iq_commit();
+        _iq_open = true;
+        //a continuous recording is cut into 10 minute files
+        _iq_left = uint32_t((_iq_fast ? 600.0 : _iq_rec_s) * _fs / SOOP_CAPTURE_BLOCK) + 1;
+    }
+    uint8_t *rec;
+    if ((s = iq_claim(&rec))) {
+        s->kind = IQ_DATA;
+        if (_iq_bits == 16) {
+            memcpy(rec, iq, _iq_rec_bytes);
+        } else {
+            soop_iq4_pack(iq, SOOP_CAPTURE_BLOCK, rec);
+        }
+        iq_commit();
+    } else {
+        //the card is that far behind: this block is not recorded, and the log says which
+        _iq_dropped++;
+        AP::logger().WriteStreaming("SOD", "TimeUS,S", "QQ", AP_HAL::micros64(), first_sample);
+    }
+    if (--_iq_left == 0) {
+        _iq_open = false;
+        if ((s = iq_claim(nullptr))) {
+            s->kind = IQ_CLOSE;
+            iq_commit();
+        } else {
+            _iq_close_pending = true;
+        }
+    }
+}
+
+//its own thread: the only code that touches the card for I/Q. A card stall waits here
+void AP_SoOP::iq_writer()
+{
     char path[40];
-    if (_iq_fd < 0) {
-        if (t < _iq_next_t) {
-            return;
+    int16_t n = -1;                       //file number, from the first free one
+    while (true) {
+        if (_iq_tail == _iq_head) {
+            hal.scheduler->delay(2);
+            continue;
         }
-        const double every = _iq_every_s > 0 ? _iq_every_s : 300.0;
-        _iq_next_t = t + every;
-        //leave the card room for the flight log: no snippet with under 1 GB free
-        if (AP::FS().disk_free(SOOP_DIR) < int64_t(1024) * 1024 * 1024) {
-            return;
-        }
-        if (_iq_n < 0) {                  //the first free number, so a reboot adds files
-            struct stat st;
-            for (_iq_n = 0; _iq_n < 9999; _iq_n++) {
-                snprintf(path, sizeof(path), "%s/iq%04d.bin", SOOP_DIR, int(_iq_n));
-                if (AP::FS().stat(path, &st) != 0) {
-                    break;
+        __sync_synchronize();             //the slot's contents after seeing it committed
+        const iq_slot_t *s = &_iq_slots[_iq_tail];
+        uint32_t used = 1;
+        const char *ext = s->bits == 16 ? "bin" : "iq4";
+        switch (s->kind) {
+        case IQ_OPEN:
+            if (_iq_fd >= 0) {
+                AP::FS().close(_iq_fd);
+                _iq_fd = -1;
+            }
+            //leave the card room for the flight log: nothing new with under 3 GB free. Near
+            //full, ArduPilot deletes the OLDEST logs (LOG_FILE_MB_FREE), a trip's start
+            _iq_skip = AP::FS().disk_free(SOOP_DIR) < int64_t(3) * 1024 * 1024 * 1024;
+            if (_iq_skip) {
+                break;
+            }
+            if (n < 0) {                  //so a reboot adds files rather than overwriting
+                struct stat st;
+                for (n = 0; n < 9999; n++) {
+                    snprintf(path, sizeof(path), "%s/iq%04d.%s", SOOP_DIR, int(n), ext);
+                    if (AP::FS().stat(path, &st) != 0) {
+                        break;
+                    }
                 }
             }
+            snprintf(path, sizeof(path), "%s/iq%04d.%s", SOOP_DIR, int(n), ext);
+            _iq_fd = AP::FS().open(path, O_WRONLY | O_CREAT | O_TRUNC);
+            if (_iq_fd >= 0) {
+                AP::logger().WriteStreaming("SOI", "TimeUS,N,S,T,Bits", "QHQdB", AP_HAL::micros64(),
+                                            uint16_t(n), s->first_sample, s->t, s->bits);
+                n++;
+                _iq_since_sync = 0;
+            }
+            break;
+        case IQ_DATA: {
+            //a run of DATA slots up to the head or the end of the array is one write: the
+            //card is far faster at a cluster than at a block at a time
+            const uint32_t head = _iq_head;
+            while (used < IQ_RUN_MAX && _iq_tail + used < _iq_nslots && _iq_tail + used != head
+                   && _iq_slots[_iq_tail + used].kind == IQ_DATA) {
+                used++;
+            }
+            if (_iq_fd >= 0 && !_iq_skip) {
+                const int32_t len = int32_t(used * _iq_rec_bytes);
+                if (AP::FS().write(_iq_fd, _iq_data + size_t(_iq_tail) * _iq_rec_bytes, len) != len) {
+                    AP::FS().close(_iq_fd);
+                    _iq_fd = -1;
+                    GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SoOP: I/Q write failed, file closed");
+                } else {
+                    _iq_written += used;
+                    //FAT writes a file's size only when it is closed or synced: without this a
+                    //power cut lost the whole open file (up to 10 minutes)
+                    _iq_since_sync += used;
+                    if (_iq_since_sync >= IQ_SYNC_BLOCKS) {
+                        AP::FS().fsync(_iq_fd);
+                        _iq_since_sync = 0;
+                    }
+                }
+            }
+            break;
         }
-        snprintf(path, sizeof(path), "%s/iq%04d.bin", SOOP_DIR, int(_iq_n));
-        _iq_fd = AP::FS().open(path, O_WRONLY | O_CREAT | O_TRUNC);
-        if (_iq_fd < 0) {
-            return;
+        case IQ_CLOSE:
+            if (_iq_fd >= 0) {
+                AP::FS().close(_iq_fd);
+                _iq_fd = -1;
+            }
+            _iq_skip = false;
+            break;
         }
-        _iq_left = uint32_t(_iq_rec_s * _fs / SOOP_CAPTURE_BLOCK) + 1;
-        AP::logger().WriteStreaming("SOI", "TimeUS,N,S,T", "QHQd", AP_HAL::micros64(),
-                                    uint16_t(_iq_n), first_sample, t);
-        _iq_n++;
-    }
-    const int32_t want = 4 * SOOP_CAPTURE_BLOCK;
-    if (AP::FS().write(_iq_fd, iq, want) != want || --_iq_left == 0) {
-        AP::FS().close(_iq_fd);
-        _iq_fd = -1;
+        __sync_synchronize();
+        _iq_tail = (_iq_tail + used) % _iq_nslots;
     }
 }
 
@@ -592,6 +833,10 @@ void AP_SoOP::run_block(const int16_t *iq, uint64_t first_sample)
     soop_burst_t out[8];
     if (!_have_first || first_sample != _next_first) {
         if (_have_first) {
+            //blocks the thread fell behind on: the DSP restarts across them, and an I/Q file
+            //simply carries on without them, so log where the samples jump to line it up later
+            AP::logger().WriteStreaming("SOG", "TimeUS,From,To", "QQQ", AP_HAL::micros64(),
+                                        _next_first, first_sample);
             soop_dsp_init(_dsp);          //a gap: the filters and history would straddle it
             soop_dsp_set_lo(_dsp, _lo_off);
         }
@@ -614,6 +859,7 @@ void AP_SoOP::run_block(const int16_t *iq, uint64_t first_sample)
         if (_bq_n == AP_SOOP_BURST_QUEUE) {
             break;
         }
+        _heard_ms = AP_HAL::millis();
         burst_t &b = _bq[_bq_n++];
         b.t = _t0 + (_dsp_base + out[i].t_sample) / _fs;
         b.f = out[i].f_hz;
@@ -712,9 +958,10 @@ void AP_SoOP::feed_until(double horizon)
         }
         if (v.gps_ok && _gps_time_only) {
             //time only: the u-blox's position stays out, so what the log shows is Iridium alone
-            soop_guard_set_time(_guard, v.t, v.gps_utc + _nav->cfg.gps_lag_s);
+            soop_guard_set_time(_guard, v.t, v.gps_utc + (v.pps ? 0.0 : _nav->cfg.gps_lag_s));
         } else if (v.gps_ok) {
-            soop_guard_gps(_guard, v.t, v.gps_utc, v.gps_ecef);
+            //soop_nav_gps adds gps_lag_s; a PPS time already is the epoch's
+            soop_guard_gps(_guard, v.t, v.gps_utc - (v.pps ? _nav->cfg.gps_lag_s : 0.0), v.gps_ecef);
             _guard_dist = float(_guard->dist_m);
             _guard_state = uint8_t(_guard->state);
             clock_learn(v.temp_c);
@@ -737,6 +984,8 @@ void AP_SoOP::publish(double t)
                       (utc - soop_nav_cat_newest_epoch(_nav)) / 86400.0, _nav->cfg.max_tle_age_d,
                       _nav->n_cat);
     }
+    //for the green blinks: once the clock is found it navigates, u-blox or not
+    _stage = _nav->have_clock ? 3 : _gps_stage >= 2 && _nav->have_time ? 2 : MIN(_gps_stage, 1);
     soop_fix_t f;
     bool valid = soop_guard_fix(_guard, t, &f);
     if (_gps_time_only) {
@@ -856,6 +1105,12 @@ void AP_SoOP::clock_save(double t)
 void AP_SoOP::log_status(double t)
 {
     clock_save(t);
+    if (_iq_slots) {
+        //the I/Q ring: blocks waiting for the card, never recorded, and written
+        const uint32_t queued = (_iq_head + _iq_nslots - _iq_tail) % _iq_nslots;
+        AP::logger().WriteStreaming("SOQ", "TimeUS,Q,D,W", "QIII", AP_HAL::micros64(),
+                                    queued, _iq_dropped, _iq_written);
+    }
     const float cpu = _samples_s ? 100.0f * _cpu_us / (1e6f * _samples_s / float(SOOP_FS)) : 0;
     if (_capturing) {
         tuner.check_lock();
