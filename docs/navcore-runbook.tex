@@ -1440,6 +1440,51 @@ drifts over those 30 minutes sets \file{clkd\_q} (the default, 0.08\,Hz/s/$\sqrt
 assumes the board temperature wanders by about 3\,\degC).
 \end{enumerate}
 
+\subsection{Step 2b --- the first real sky (Castle Mound, 2026-11-16)}
+
+The board heard the real sky for the first time on Castle Mound, Cambridge, static, the HC610
+on its pigtail, GPS denied in software for 30 and 52 minutes. All of it is in
+\file{00000034.BIN}, and \file{tools/soop\_replay.py} runs that log through the navigation
+again on the host, with one setting changed at a time.
+
+\textbf{What had to be fixed first} (commit \file{ef97050}). The H743 rev V halves the ADC's
+32\,MHz clock, so 16.5 + 8.5 cycles missed every other trigger: 250\,kSPS, every frequency read
+double, nothing matched a satellite. The boot message \emph{SoOP: I/Q at N kSPS} now says if
+the rate is off; check it before \file{swap\_iq}, which looked like the fix and was not. And
+GPS time read before the u-blox knew the week wrapped to millions of years, so every element
+set looked stale.
+
+\textbf{What the sky delivered.} Up to 300 bursts a minute at 47--55\,dB-Hz, 66\% fused, 31\%
+unmatched, 1\% ambiguous; 1--4 satellites tracked. The supplemental orbits were 35\,m rms
+along-track; transmitter offsets were $-14$ to $+38$\,Hz except IRIDIUM 169 at $-279$\,Hz.
+The TCXO moved $+19$\,Hz/\degC{} at the carrier as the board warmed itself from 18 to
+32\,\degC. Noise rose 26\,dB with the feed on (16--23 expected).
+
+\textbf{What limits accuracy, measured by replay:}
+\begin{itemize}
+\item \textbf{Velocity, not the clock.} Denied, the filter allowed 1.5\,m/s of velocity
+  drift and the fix walked 137--330\,m median. A disarmed board whose IMU is at rest now
+  takes zero velocity (\file{soop\_nav\_still}, \file{SOF.St}): the same log holds 1--3\,m.
+\item \textbf{The GPS time tag.} ArduPilot stamps a u-blox fix when its message arrives,
+  75\,ms late; started blind that put the fix 500\,m north. \file{gps\_lag\_s} (default
+  0.075 on the board) corrects it; an anchored filter learns it anyway. A PPS line would
+  remove it.
+\item \textbf{Geometry.} A lone satellite overhead barely fixes the cross-track: 1.5\,km
+  at 17:50--18:00. Plan with \cmd{tools/soop\_plan.py LAT LON}, which ranks windows by
+  satellites at 20--55$^\circ$ together, not by elevation.
+\item Blind and at rest, Iridium alone holds 50--130\,m median. Tightening the clock model,
+  or feeding the TCXO's temperature slope forward, made it worse.
+\end{itemize}
+
+\textbf{CPU.} \file{SOS.CPU} is wall time inside the DSP, so it counts the flight code that
+pre-empts the SoOP thread; \file{SOS.Ovr} (blocks dropped) is the figure to watch. At the
+Mound the DSP dropped 4--7\% of blocks; since \file{e3560f9} it drops none at the desk.
+
+\textbf{Running a session.} \cmd{tools/soop\_session.py OUT.csv PLAN} records both receivers
+and denies GPS on a plan (\file{off:1800,on:300,...}); \cmd{tools/soop\_live.py OUT.csv}
+shows it in a browser; \cmd{tools/soop\_fieldlog.py} reduces it. Keep the laptop awake:
+closing the lid cut USB power and ended the Mound session at 18:10.
+
 \subsection{Step 3 --- in flight}
 
 With \file{GPS2\_TYPE 27} the Iridium fix is the second GPS and \file{GPS\_AUTO\_SWITCH 1}
