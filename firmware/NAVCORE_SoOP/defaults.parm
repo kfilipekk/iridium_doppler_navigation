@@ -119,7 +119,9 @@ DR_NEXT_MODE 6
 # --- notify ---------------------------------------------------------------
 # No safety switch is fitted, so arming must not wait for one.
 BRD_SAFETY_DEFLT 0
-NTF_LED_TYPES 257
+# The board LEDs belong to AP_SoOP (blue dim for power, green a flash per fused Iridium
+# burst): built-in off, NeoPixel (the WS2812 strip) kept.
+NTF_LED_TYPES 256
 SERVO13_FUNCTION 120
 
 TEMP_LOG 1
