@@ -14,6 +14,19 @@ Watch it with soop_watch.py; reduce it with soop_fieldlog.py.
 import sys, time, datetime, csv
 from pymavlink import mavutil
 import glob
+#a board left in its bootloader (ModemManager probing the port holds it there): tell it to boot
+for _ in range(10):
+    bl = glob.glob("/dev/serial/by-id/*NAVCORE_SoOP-BL_*")
+    if glob.glob("/dev/serial/by-id/*NAVCORE_SoOP_*") or not bl:
+        break
+    import serial
+    with serial.Serial(bl[0], 115200, timeout=1) as s:
+        s.write(b"\x21\x20")                   #GET_SYNC
+        time.sleep(0.2)
+        s.read(2)
+        s.write(b"\x30\x20")                   #BOOT
+    print("board was in its bootloader: booted it", flush=True)
+    time.sleep(8)
 dev=(glob.glob("/dev/serial/by-id/*NAVCORE_SoOP_*") or ["/dev/ttyACM0"])[0]
 m=mavutil.mavlink_connection(dev); m.wait_heartbeat(timeout=20)
 m.mav.request_data_stream_send(m.target_system,m.target_component,mavutil.mavlink.MAV_DATA_STREAM_ALL,2,1)

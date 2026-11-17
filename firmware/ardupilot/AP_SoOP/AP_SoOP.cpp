@@ -271,6 +271,19 @@ void AP_SoOP::load_config()
             _ant_feed_off = is_zero(val);
         } else if (!strcmp(key, "ind_vel")) {
             _ind_vel = !is_zero(val);
+        } else if (!strcmp(key, "gps_pos")) {
+            _gps_time_only = is_zero(val);
+        } else if (!strcmp(key, "start_lat")) {
+            _start_lla[0] = val;
+            _start_keys |= 1;
+        } else if (!strcmp(key, "start_lon")) {
+            _start_lla[1] = val;
+            _start_keys |= 2;
+        } else if (!strcmp(key, "start_h")) {
+            _start_lla[2] = val;
+            _start_keys |= 4;
+        } else if (!strcmp(key, "start_sigma")) {
+            _start_sigma = val;
         } else if (!strcmp(key, "bbg")) {
             _bbg = uint8_t(constrain_int16(int16_t(val), 0, 15));
         } else if (!strcmp(key, "lo_offset_hz")) {
@@ -530,6 +543,16 @@ void AP_SoOP::feed_until(double horizon)
             WITH_SEMAPHORE(_sem);
             _veh_tail = (_veh_tail + 1) % AP_SOOP_VEH_QUEUE;
         }
+        if (_start_keys == 7 && !_start_done) {
+            //the surveyed (or deliberately wrong) start, once, before anything else moves it
+            double ecef[3];
+            soop_ecef(_start_lla[0], _start_lla[1], _start_lla[2], ecef);
+            const double sigma = _start_sigma > 0 ? _start_sigma : 5000.0;
+            soop_guard_set_position(_guard, v.t, ecef, sigma);
+            _start_done = true;
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SoOP: start %.5f %.5f, %.0f m", _start_lla[0],
+                          _start_lla[1], sigma);
+        }
         if (v.armed && !_was_armed) {
             soop_guard_arm(_guard, v.t);    //from here the GPS is checked against Iridium
         }
@@ -543,7 +566,10 @@ void AP_SoOP::feed_until(double horizon)
         if (v.ind_ok) {
             soop_guard_velocity_ind(_guard, v.t, v.ivn, v.ive, v.ivd);
         }
-        if (v.gps_ok) {
+        if (v.gps_ok && _gps_time_only) {
+            //time only: the u-blox's position stays out, so what the log shows is Iridium alone
+            soop_guard_set_time(_guard, v.t, v.gps_utc + _nav->cfg.gps_lag_s);
+        } else if (v.gps_ok) {
             soop_guard_gps(_guard, v.t, v.gps_utc, v.gps_ecef);
             _guard_dist = float(_guard->dist_m);
             _guard_state = uint8_t(_guard->state);
@@ -568,7 +594,13 @@ void AP_SoOP::publish(double t)
                       _nav->n_cat);
     }
     soop_fix_t f;
-    const bool valid = soop_guard_fix(_guard, t, &f);
+    bool valid = soop_guard_fix(_guard, t, &f);
+    if (!valid && _gps_time_only) {
+        //a blind start is never anchored; it is a test, so offer the fix as GPS2 anyway (the EKF
+        //stays on the u-blox, which has more satellites). SOF.V keeps the flight rule
+        valid = _nav->have_clock && _nav->have_time && f.n_track > 0
+                && f.hacc_m < _nav->cfg.fix_max_hacc;
+    }
     //a log format holds at most 16 fields, and SOS has them: the still flag lives here
     AP::logger().WriteStreaming("SOF", "TimeUS,Lat,Lng,Alt,HAcc,VAcc,SAcc,NIS,NT,V,St",
                                 "QLLfffffBBB", AP_HAL::micros64(),       //NIS is a float

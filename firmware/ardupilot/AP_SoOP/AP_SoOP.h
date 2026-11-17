@@ -100,6 +100,12 @@ private:
     AP_HAL::AnalogSource *_ant_adc;
     volatile bool _ant_feed_off;
     volatile bool _ind_vel;          //feed the guard flow-derived velocity (soop.cfg ind_vel)
+    //a blind start, for measuring Iridium alone: the u-blox gives time only (soop.cfg gps_pos 0)
+    //and the navigation starts from start_lat/lon/h, start_sigma m
+    bool       _gps_time_only;
+    double     _start_lla[3], _start_sigma;
+    uint8_t    _start_keys;      //which of start_lat, start_lon, start_h were given
+    bool       _start_done;
     uint64_t   _samples_s;
     //the TCXO's offset per degree, remembered across flights in clock.dat
     static const int CLK_T0 = -20, CLK_N = 100;

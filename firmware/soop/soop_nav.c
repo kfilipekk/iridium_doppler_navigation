@@ -409,10 +409,38 @@ void soop_nav_baro(soop_nav_t *nav, double t_board, double h_m)
     ned_matrix(nav->x, R);
     soop_geodetic(nav->x, &lat, &lon, &hh);
     hrow_t h = { 0, {0}, {0} };
+    const double up[3] = { -R[0][2], -R[1][2], -R[2][2] };
     for (int i = 0; i < 3; i++)
-        hrow_add(&h, IP + i, -R[i][2]);          //up = -down
+        hrow_add(&h, IP + i, up[i]);
     hrow_add(&h, IBB, 1.0);
-    kalman(nav, &h, h_m - (hh + nav->x[IBB]), nav->cfg.baro_sigma * nav->cfg.baro_sigma);
+    //a height moves the position along up only. Started blind, the horizontal sigma is km and
+    //the vertical metres; the full gain then let the slightest turn of "up" between updates
+    //move the fix sideways, more each second - 4 km in 6 s on the board (2026-11-17). So the
+    //gain's position part is kept along up, and P takes the Joseph form, right for any gain
+    const int n = nav->n;
+    const double r2 = nav->cfg.baro_sigma * nav->cfg.baro_sigma;
+    double PH[SOOP_NAV_NX], K[SOOP_NAV_NX];
+    for (int i = 0; i < n; i++) {
+        double s = 0.0;
+        for (int k = 0; k < h.m; k++)
+            s += nav->P[i][h.idx[k]] * h.val[k];
+        PH[i] = s;
+    }
+    double S = r2;
+    for (int k = 0; k < h.m; k++)
+        S += h.val[k] * PH[h.idx[k]];
+    for (int i = 0; i < n; i++)
+        K[i] = PH[i] / S;
+    const double ku = K[IP] * up[0] + K[IP + 1] * up[1] + K[IP + 2] * up[2];
+    for (int i = 0; i < 3; i++)
+        K[IP + i] = ku * up[i];
+    const double y = h_m - (hh + nav->x[IBB]);
+    for (int i = 0; i < n; i++)
+        nav->x[i] += K[i] * y;
+    //(I - K H) P (I - K H)^T + K r K^T = P - K PH^T - PH K^T + S K K^T
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            nav->P[i][j] += S * K[i] * K[j] - K[i] * PH[j] - PH[i] * K[j];
 }
 
 void soop_nav_still(soop_nav_t *nav, double t_board)
