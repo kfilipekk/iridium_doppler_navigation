@@ -23,7 +23,10 @@ sys.path.insert(0, HERE)
 import soop_solver as sol
 
 STILL_GYRO = 0.03       #rad/s, and
-STILL_ACC = 0.3         #m/s^2 off gravity, held for
+STILL_ACC = 0.3         #m/s^2 off gravity, and steady:
+STILL_ACC_SD = 0.1      #m/s^2 of |accel| spread, with
+STILL_GPS_SPD = 1.0     #the u-blox under this when it has a fix,
+MOVING_SPD = 3.0        #(its last word over this latching 'moving'), held for
 STILL_HOLD_S = 2.0      #as AP_SoOP's detector
 UNDULATION_M = 45.7     #EGM96 at Cambridge; the board logs MSL altitude, the filter wants WGS84
 J2000_JD = 2451545.0
@@ -41,6 +44,8 @@ def build_obs(path, out_path, deny=(), still=True):
     hacc, baro_off, n = 99.0, None, dict(D=0, E=0, G=0, A=0, Z=0)
     last_e = last_a = -1.0
     still_since, last_z, armed = None, -1.0, False
+    acc_m = acc_m2 = None
+    moving, gps_rest = False, True
     while True:
         x = m.recv_match(type=["GPS", "GPA", "BARO", "XKF1", "SOB", "IMU", "ARM"])
         if x is None:
@@ -52,7 +57,13 @@ def build_obs(path, out_path, deny=(), still=True):
         elif k == "IMU" and x.I == 0 and still:
             gyro = math.sqrt(x.GyrX ** 2 + x.GyrY ** 2 + x.GyrZ ** 2)
             acc = math.sqrt(x.AccX ** 2 + x.AccY ** 2 + x.AccZ ** 2)
-            if armed or gyro > STILL_GYRO or abs(acc - 9.80665) > STILL_ACC:
+            #the board's running spread is over ~1 s at 50 Hz; the log has IMU at 25 Hz
+            a = 0.1
+            acc_m = acc if acc_m is None else acc_m + a * (acc - acc_m)
+            acc_m2 = acc * acc if acc_m2 is None else acc_m2 + a * (acc * acc - acc_m2)
+            acc_sd = math.sqrt(max(0.0, acc_m2 - acc_m * acc_m))
+            if (armed or gyro > STILL_GYRO or abs(acc - 9.80665) > STILL_ACC or acc_sd > STILL_ACC_SD
+                    or not gps_rest):
                 still_since = None
             elif still_since is None:
                 still_since = t
@@ -69,6 +80,14 @@ def build_obs(path, out_path, deny=(), still=True):
             if utc_day0 is None:
                 utc_day0 = math.floor((utc_j2000 + 43200.0) / 86400.0) * 86400.0 - 43200.0
             sod = (utc_j2000 - utc_day0) % 86400.0
+            if gps_good(x, hacc):
+                if x.Spd > MOVING_SPD:
+                    moving = True
+                elif x.Spd < STILL_GPS_SPD:
+                    moving = False
+                gps_rest = x.Spd < STILL_GPS_SPD
+            else:
+                gps_rest = not moving
             denied = any(a <= sod <= b for a, b in deny)
             if gps_good(x, hacc) and not denied:
                 h = x.Alt + UNDULATION_M

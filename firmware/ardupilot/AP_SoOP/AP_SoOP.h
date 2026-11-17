@@ -52,11 +52,18 @@ private:
     void publish(double t);
     void log_status(double t);
     void ant_update(double t);
+    void led_tick();
+    void iq_record(const int16_t *iq, uint64_t first_sample);
     void clock_load(float temp_c);
     void clock_learn(float temp_c);
     void clock_save(double t);
 
     bool     _started;
+    //the board LEDs, once NTF_LED_TYPES leaves them: blue dim and steady for power, green a
+    //flash for each burst fused to a satellite
+    bool     _leds;
+    uint8_t  _led_n;
+    volatile uint32_t _fused_ms;
     HAL_Semaphore _sem;
     veh_t    _veh[AP_SOOP_VEH_QUEUE];
     uint16_t _veh_head, _veh_tail;
@@ -87,6 +94,8 @@ private:
     double     _undulation;      //m, geoid above ellipsoid, from the GPS when it says
     float      _baro_offset;     //ellipsoidal height minus baro altitude, learnt on GPS
     double     _still_since = -1;//board s the IMU came to rest, -1 while it moves
+    float      _acc_m, _acc_m2;  //running mean and mean square of |accel|: its steadiness
+    bool       _moving_latch;    //the u-blox saw it move; only the u-blox can say it stopped
     bool       _still;
     bool       _have_baro_offset;
     double     _last_fix_t, _last_status_t;
@@ -106,6 +115,13 @@ private:
     double     _start_lla[3], _start_sigma;
     uint8_t    _start_keys;      //which of start_lat, start_lon, start_h were given
     bool       _start_done;
+    bool       _no_still;        //soop.cfg still 0: a vehicle that cruises disarmed (an airliner)
+    //raw I/Q snippets: iq_rec_s seconds every iq_every_s (soop.cfg; 0 = off)
+    double     _iq_rec_s, _iq_every_s, _iq_next_t;
+    int        _iq_fd = -1;
+    uint32_t   _iq_left;         //blocks still to write in this snippet
+    int16_t    _iq_n = -1;       //file number, -1 until the first free one is found
+    volatile uint32_t _gps_good_ms; //when the u-blox last passed the 'good' test
     uint64_t   _samples_s;
     //the TCXO's offset per degree, remembered across flights in clock.dat
     static const int CLK_T0 = -20, CLK_N = 100;

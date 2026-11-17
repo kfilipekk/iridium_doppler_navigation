@@ -29,16 +29,29 @@ extern const AP_HAL::HAL& hal;
 //ArduPilot compiles with -fsingle-precision-constant
 static const uint64_t UNIX_J2000_US = 946728000ULL * 1000000ULL;   //12:00 UTC
 static const uint64_t GPS_UNIX_S = 315964800ULL;                     //1980-01-06 00:00 UTC
-//at rest: the IMU this quiet for this long. An IMU cannot tell rest from steady cruise, so
-//it only counts disarmed
+//at rest: disarmed, the IMU this quiet and this steady for this long, and the u-blox agreeing
+//where it can see. An IMU alone cannot tell rest from steady cruise; steadiness separates a
+//table (0.01 m/s/s, 0.08 at most at Castle Mound) from a cabin in flight (0.1-0.5), and the
+//u-blox, or its last word before a dropout, separates the rest
 static const float STILL_GYRO = 0.03f;      //rad/s
 static const float STILL_ACC = 0.3f;        //m/s/s off gravity
+static const float STILL_ACC_SD = 0.1f;     //m/s/s, |accel|'s spread over about a second
+static const float STILL_GPS_SPD = 1.0f;    //m/s: the u-blox reads up to 0.65 at rest indoors
+static const float MOVING_SPD = 3.0f;       //m/s: past this the u-blox has seen it move
 static const double STILL_HOLD_S = 2.0;
+static const uint32_t BARO_FRESH_MS = 30000;//time only: a cabin's baro, tied to the u-blox
 //a u-blox stamps a fix when its message arrives: the navigation measured 75 +- 3 ms against
 //Iridium at Castle Mound (2026-11-16), and a blind start needs it set
 static const double GPS_LAG_S = 0.075;
 static const uint32_t LEAP_S = 18;                                   //GPS - UTC since 2017
 static const char *SOOP_DIR = "APM/SOOP";
+//LED0 (blue, D2) and LED1 (green, D3) sink through PE3 and PE4: low is on
+#if defined(HAL_GPIO_A_LED_PIN) && defined(HAL_GPIO_B_LED_PIN)
+#define AP_SOOP_LEDS 1
+static const uint8_t LED_BLUE = HAL_GPIO_B_LED_PIN, LED_GREEN = HAL_GPIO_A_LED_PIN;
+#endif
+static const uint8_t BLUE_ON_OF = 8;     //1 ms in 8 from the 1 kHz timer: dim, no flicker
+static const uint32_t GREEN_MS = 60;     //green after each fused burst
 
 static AP_SoOP_MAX2112 tuner;
 static AP_SoOP_Capture capture;
@@ -59,6 +72,18 @@ void AP_SoOP::update()
     ant_update(AP_HAL::micros64() / double(1000000));
     if (!_started) {
         _started = true;
+#ifdef AP_SOOP_LEDS
+        //take the board LEDs only if notify has let them go, or the two would fight
+        float ntf = 1;
+        if (AP_Param::get("NTF_LED_TYPES", ntf) && !(uint32_t(ntf) & 1U)) {
+            _leds = true;
+            hal.gpio->pinMode(LED_BLUE, HAL_GPIO_OUTPUT);
+            hal.gpio->pinMode(LED_GREEN, HAL_GPIO_OUTPUT);
+            hal.scheduler->register_timer_process(FUNCTOR_BIND_MEMBER(&AP_SoOP::led_tick, void));
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "SoOP: LEDs left to notify (NTF_LED_TYPES bit 0)");
+        }
+#endif
         if (!hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_SoOP::thread_main, void),
                                           "SoOP", 8192, AP_HAL::Scheduler::PRIORITY_STORAGE, 1)) {
             GCS_SEND_TEXT(MAV_SEVERITY_ERROR, "SoOP: no thread");
@@ -79,18 +104,6 @@ void AP_SoOP::update()
     veh_t v {};
     v.t = AP_HAL::micros64() / double(1000000);
     v.armed = hal.util->get_soft_armed();
-    {
-        const AP_InertialSensor &ins = AP::ins();
-        const bool rest = !v.armed && ins.get_gyro().length() < STILL_GYRO
-                          && fabsf(ins.get_accel().length() - GRAVITY_MSS) < STILL_ACC;
-        if (!rest) {
-            _still_since = -1;
-        } else if (_still_since < 0) {
-            _still_since = v.t;
-        }
-        v.still = rest && v.t - _still_since >= STILL_HOLD_S;
-        _still = v.still;
-    }
 
     Vector3f vel;
     const AP_AHRS &ahrs = AP::ahrs();
@@ -118,10 +131,49 @@ void AP_SoOP::update()
         soop_ecef(loc.lat / double(10000000), loc.lng / double(10000000), h, v.gps_ecef);
         v.gps_utc = (gps_us - UNIX_J2000_US) / double(1000000);
         v.gps_ok = true;
+        _gps_good_ms = AP_HAL::millis();
         const float b = AP::baro().get_altitude();
         const float off = h - b;                    //baro is relative: tie it to the GPS
         _baro_offset = _have_baro_offset ? 0.98f * _baro_offset + 0.02f * off : off;
         _have_baro_offset = true;
+    }
+    if (_gps_time_only) {
+        //a moving test (an airliner, disarmed): the EKF without GPS drifts on the IMU and then
+        //holds still, which at 250 m/s is wrong and would be trusted. Take the u-blox's own
+        //velocity while it is good, and none without it, so the navigation carries the last
+        v.vel_ok = good;
+        if (good) {
+            const Vector3f &gv = gps.velocity(0);
+            v.vn = gv.x;
+            v.ve = gv.y;
+            v.vd = gv.z;
+        }
+    }
+    {
+        const AP_InertialSensor &ins = AP::ins();
+        const float an = ins.get_accel().length();
+        _acc_m += 0.05f * (an - _acc_m);
+        _acc_m2 += 0.05f * (an * an - _acc_m2);
+        const float acc_sd = sqrtf(MAX(0.0f, _acc_m2 - _acc_m * _acc_m));
+        bool gps_rest = !_moving_latch;
+        if (good) {
+            const float spd = gps.ground_speed();
+            if (spd > MOVING_SPD) {
+                _moving_latch = true;
+            } else if (spd < STILL_GPS_SPD) {
+                _moving_latch = false;
+            }
+            gps_rest = spd < STILL_GPS_SPD;
+        }
+        const bool rest = !v.armed && gps_rest && ins.get_gyro().length() < STILL_GYRO
+                          && fabsf(an - GRAVITY_MSS) < STILL_ACC && acc_sd < STILL_ACC_SD;
+        if (!rest) {
+            _still_since = -1;
+        } else if (_still_since < 0) {
+            _still_since = v.t;
+        }
+        v.still = !_no_still && rest && v.t - _still_since >= STILL_HOLD_S;
+        _still = v.still;
     }
     v.temp_c = AP::ins().get_temperature(0);
 #if AP_OPTICALFLOW_ENABLED && AP_RANGEFINDER_ENABLED
@@ -146,7 +198,10 @@ void AP_SoOP::update()
         }
     }
 #endif
-    if (_have_baro_offset && AP::baro().healthy()) {
+    //time only (a cabin): the baro reads cabin pressure, and its offset is the u-blox's
+    //height; once that is stale a climb or descent would move it, so it waits for the u-blox
+    if (_have_baro_offset && AP::baro().healthy()
+        && (!_gps_time_only || AP_HAL::millis() - _gps_good_ms < BARO_FRESH_MS)) {
         v.baro_h = AP::baro().get_altitude() + _baro_offset;
         v.baro_ok = true;
     }
@@ -157,6 +212,18 @@ void AP_SoOP::update()
         _veh[_veh_head] = v;
         _veh_head = next;
     }
+}
+
+//timer thread, 1 kHz
+void AP_SoOP::led_tick()
+{
+#ifdef AP_SOOP_LEDS
+    if (++_led_n >= BLUE_ON_OF) {
+        _led_n = 0;
+    }
+    hal.gpio->write(LED_BLUE, _led_n != 0);
+    hal.gpio->write(LED_GREEN, AP_HAL::millis() - _fused_ms >= GREEN_MS);
+#endif
 }
 
 //antenna feed
@@ -284,6 +351,12 @@ void AP_SoOP::load_config()
             _start_keys |= 4;
         } else if (!strcmp(key, "start_sigma")) {
             _start_sigma = val;
+        } else if (!strcmp(key, "still")) {
+            _no_still = is_zero(val);
+        } else if (!strcmp(key, "iq_rec_s")) {
+            _iq_rec_s = val;
+        } else if (!strcmp(key, "iq_every_s")) {
+            _iq_every_s = val;
         } else if (!strcmp(key, "bbg")) {
             _bbg = uint8_t(constrain_int16(int16_t(val), 0, 15));
         } else if (!strcmp(key, "lo_offset_hz")) {
@@ -293,6 +366,17 @@ void AP_SoOP::load_config()
                 c.f_lo = SOOP_F_RING_ALERT + val;
             } else {
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SoOP: lo_offset_hz %.0f outside 20-150 kHz", val);
+            }
+        } else if (!strcmp(key, "record_lo_hz")) {
+            //record only: the tuner anywhere in the L band around Iridium (its duplex channels are
+            //1616-1626 MHz), for I/Q snippets to study offline. The DSP and navigation look for
+            //Ring Alert where it is not, so their output means nothing
+            if (val >= 1610.0e6 && val <= 1630.0e6) {
+                c.f_lo = val;
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SoOP: record only at %.3f MHz - no navigation",
+                              val * 1e-6);
+            } else {
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SoOP: record_lo_hz %.0f outside 1610-1630 MHz", val);
             }
         } else {
             known = false;
@@ -450,6 +534,56 @@ void AP_SoOP::thread_main()
             continue;
         }
         run_block(_block, first);
+        if (!_replay) {
+            iq_record(_block, first);
+        }
+    }
+}
+
+//raw I/Q snippets, as the DSP was handed them (interleaved int16 I, Q at SOOP_FS): what it
+//keeps of a burst is a few numbers, and the capture also holds the other simplex channels,
+//so a better DSP can run over these later (dsp_host, or soop.cfg replay). SOI logs each
+//file's first sample and its board time
+void AP_SoOP::iq_record(const int16_t *iq, uint64_t first_sample)
+{
+    if (_iq_rec_s <= 0) {
+        return;
+    }
+    const double t = _t0 + first_sample / _fs;
+    char path[40];
+    if (_iq_fd < 0) {
+        if (t < _iq_next_t) {
+            return;
+        }
+        const double every = _iq_every_s > 0 ? _iq_every_s : 300.0;
+        _iq_next_t = t + every;
+        //leave the card room for the flight log: no snippet with under 1 GB free
+        if (AP::FS().disk_free(SOOP_DIR) < int64_t(1024) * 1024 * 1024) {
+            return;
+        }
+        if (_iq_n < 0) {                  //the first free number, so a reboot adds files
+            struct stat st;
+            for (_iq_n = 0; _iq_n < 9999; _iq_n++) {
+                snprintf(path, sizeof(path), "%s/iq%04d.bin", SOOP_DIR, int(_iq_n));
+                if (AP::FS().stat(path, &st) != 0) {
+                    break;
+                }
+            }
+        }
+        snprintf(path, sizeof(path), "%s/iq%04d.bin", SOOP_DIR, int(_iq_n));
+        _iq_fd = AP::FS().open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        if (_iq_fd < 0) {
+            return;
+        }
+        _iq_left = uint32_t(_iq_rec_s * _fs / SOOP_CAPTURE_BLOCK) + 1;
+        AP::logger().WriteStreaming("SOI", "TimeUS,N,S,T", "QHQd", AP_HAL::micros64(),
+                                    uint16_t(_iq_n), first_sample, t);
+        _iq_n++;
+    }
+    const int32_t want = 4 * SOOP_CAPTURE_BLOCK;
+    if (AP::FS().write(_iq_fd, iq, want) != want || --_iq_left == 0) {
+        AP::FS().close(_iq_fd);
+        _iq_fd = -1;
     }
 }
 
@@ -529,6 +663,9 @@ void AP_SoOP::feed_until(double horizon)
             const burst_t b = _bq[bi];
             _bq[bi] = _bq[--_bq_n];
             const int res = soop_guard_burst_sv(_guard, b.t, b.f, b.sigma, b.sv);
+            if (res == SOOP_B_FUSED) {
+                _fused_ms = AP_HAL::millis();
+            }
             AP::logger().WriteStreaming("SOB", "TimeUS,T,F,Sig,CN0,Res,Sat,Ch,Inn",
                                         "QdfffBIbf", AP_HAL::micros64(), b.t, b.f, b.sigma, b.cn0,
                                         uint8_t(res), uint32_t(res == SOOP_B_FUSED ? _nav->last_sat : 0),
@@ -543,10 +680,17 @@ void AP_SoOP::feed_until(double horizon)
             WITH_SEMAPHORE(_sem);
             _veh_tail = (_veh_tail + 1) % AP_SOOP_VEH_QUEUE;
         }
-        if (_start_keys == 7 && !_start_done) {
-            //the surveyed (or deliberately wrong) start, once, before anything else moves it
+        const bool seed = _gps_time_only && _start_keys == 0 && v.gps_ok;
+        if ((_start_keys == 7 || seed) && !_start_done) {
+            //the surveyed (or deliberately wrong) start, once, before anything else moves it.
+            //Time only with none given (a moving test): the first good u-blox fix, at start_sigma
             double ecef[3];
-            soop_ecef(_start_lla[0], _start_lla[1], _start_lla[2], ecef);
+            if (seed) {
+                memcpy(ecef, v.gps_ecef, sizeof ecef);
+                soop_geodetic(ecef, &_start_lla[0], &_start_lla[1], &_start_lla[2]);
+            } else {
+                soop_ecef(_start_lla[0], _start_lla[1], _start_lla[2], ecef);
+            }
             const double sigma = _start_sigma > 0 ? _start_sigma : 5000.0;
             soop_guard_set_position(_guard, v.t, ecef, sigma);
             _start_done = true;
@@ -595,11 +739,12 @@ void AP_SoOP::publish(double t)
     }
     soop_fix_t f;
     bool valid = soop_guard_fix(_guard, t, &f);
-    if (!valid && _gps_time_only) {
-        //a blind start is never anchored; it is a test, so offer the fix as GPS2 anyway (the EKF
-        //stays on the u-blox, which has more satellites). SOF.V keeps the flight rule
+    if (_gps_time_only) {
+        //a blind start is never anchored; it is a test, so offer the fix as GPS2 anyway, but only
+        //while the u-blox is good: then the EKF stays on it (more satellites), and cannot switch
+        //onto Iridium and feed its own velocity back in. SOF.V keeps the flight rule
         valid = _nav->have_clock && _nav->have_time && f.n_track > 0
-                && f.hacc_m < _nav->cfg.fix_max_hacc;
+                && f.hacc_m < _nav->cfg.fix_max_hacc && AP_HAL::millis() - _gps_good_ms < 2000;
     }
     //a log format holds at most 16 fields, and SOS has them: the still flag lives here
     AP::logger().WriteStreaming("SOF", "TimeUS,Lat,Lng,Alt,HAcc,VAcc,SAcc,NIS,NT,V,St",

@@ -76,6 +76,15 @@ python3 tools/check_circuit.py
 | **`check_soop.py`** | **`max2112`**: MAX2112 tuner register images, PLL loop filter, and baseband bandwidth.<br>**`antenna`**: Active antenna bias-T feed monitor and current limit trip points.<br>**`dsp`**: On-board Cortex-M7 Doppler burst detector meeting the 5 Hz accuracy target.<br>**`burst`**: Synthetic burst detection and carrier estimation from raw I/Q samples.<br>**`ephemeris`**: Real Iridium TLE ephemeris propagation and constellation visibility.<br>**`sgp4`**: Agreement between Python SGP4 reference and embedded C propagator.<br>**`solver`**: Differential Doppler positioning solver accuracy against ground truth.<br>**`nav`**: GPS-denied navigation hold performance over simulated flight profiles.<br>**`bench`**: LO search that lets a receiver without a TCXO (the Pluto) record the bench sky, and `soop_bench.py` run end to end.<br>**`flow`**: The guard's flow + rangefinder velocity against EKF3's own flow model.<br>**`gain`**: Antenna-to-ADC gain plan from the parts, with the DSP gated at both ends of its spread.<br>**`spurs`**: Board clock harmonics folded through the ADC against the Ring Alert search window.<br>**`spice`**: SPICE deck simulation of front-end analogue filter stages. |
 | **`check_order.py`** | **`purchase`**: Availability and manufacturer links for every bought part.<br>**`links`**: Documentation hyperlinks and datasheet references.<br>**`modules`**: Off-board module footprint landings and connector compatibility.<br>**`module_wiring`**: Cable pinout mapping between flight controller and modules.<br>**`payload`**: Spare PWM channels, free UARTs, and payload weight budget.<br>**`bench_bounds`**: Verification of empirical bench bounds that cannot change ordering.<br>**`rf`**: RF link budget calculations for the HC610 antenna and front-end NF.<br>**`doc_figures`**: Verification that documentation diagrams match current source files. |
 
+### Field tools (the Iridium receiver under the real sky)
+
+- **`soop_plan.py`**: When to test: windows ranked by satellites at 20-55° together, lone overhead passes flagged.
+- **`soop_field.sh`**: One command for a session: recorder and live view, detached; `stop` ends both.
+- **`soop_session.py`**: Records both receivers over MAVLink and denies GPS on a plan; boots a board stuck in its bootloader.
+- **`soop_live.py`** / **`soop_watch.py`**: The session in a browser (error, map, Iridium sky, predicted Doppler, passes, bursts) or a terminal.
+- **`soop_fieldlog.py`**: Reduces a session and its dataflash logs to one JSON.
+- **`soop_replay.py`**: Runs a board log through the navigation on the host with one setting changed (`nav_host --cfg`).
+
 ---
 
 ## 3. Generic Checks from `kicad-tools`
