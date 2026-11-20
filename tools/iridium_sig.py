@@ -6,9 +6,11 @@ SYMBOL_RATE = 25_000.0            #symbols/s, all Iridium channels
 RRC_ALPHA = 0.4                   #root-raised-cosine roll-off
 CHANNEL_SPACING = 41_666.667      #Hz
 F_RING_ALERT = 1_626_270_833.0    #Hz, the Ring Alert simplex channel (IRA)
-#the four simplex messaging channels sit below it, one spacing apart
-SIMPLEX_CHANNELS = tuple(F_RING_ALERT - k * CHANNEL_SPACING for k in range(4, -1, -1))
-RING_ALERT_INDEX = 4              #SIMPLEX_CHANNELS[4] is the Ring Alert channel
+#the channels either side of it, one spacing apart - all the +-52 kHz the DSP searches holds.
+#Bursts are heard on both (2026-11-20, every session); the messaging channels proper sit above
+#Ring Alert (1626.3125-1626.4375 MHz), not below as this once assumed
+SIMPLEX_CHANNELS = tuple(F_RING_ALERT + k * CHANNEL_SPACING for k in (-1, 0, 1))
+RING_ALERT_INDEX = 1              #SIMPLEX_CHANNELS[1] is the Ring Alert channel
 
 FRAME_S = 0.090                   #TDMA frame
 SIMPLEX_SLOT_S = 0.02032          #the simplex slot at the start of every frame

@@ -370,7 +370,7 @@ void AP_SoOP::load_config()
         { "ind_vel_sigma", &_gcfg.ind_vel_sigma },
         { "gps_lag_s", &c.gps_lag_s }, { "still_sigma", &c.still_sigma },
         { "clkd_sigma", &c.clkd_sigma }, { "clkd_tau", &c.clkd_tau },
-        { "reacq_frac", &c.reacq_frac },
+        { "reacq_frac", &c.reacq_frac }, { "sig_floor", &c.sig_floor },
     };
     //no scanf here: ArduPilot's C library has none with floating point
     char *save = nullptr;

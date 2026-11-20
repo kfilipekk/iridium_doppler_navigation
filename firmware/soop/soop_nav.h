@@ -32,7 +32,7 @@ typedef struct {
     double clk_q;                    //TCXO frequency walk at the carrier, Hz/sqrt(s)
     double clkd_q;                   //its drift's walk, Hz/s/sqrt(s)
     double clkd_sigma, clkd_tau;     //the drift is Gauss-Markov: a TCXO's frequency only drifts
-                                     //as fast as its temperature moves (19 Hz/degC), and back
+                                     //as fast as its temperature moves (22-31 Hz/degC), and back
     int    reacq_n;                  //this many bursts with almost none fused: the clock is lost
     double reacq_frac;               //"almost none"
     double clk_sigma_acq;            //clock uncertainty after acquisition, Hz
@@ -118,7 +118,7 @@ typedef struct {
     int    n_acq;
 
     double last_gps, last_baro, last_fused, last_still;
-    int    last_sat, last_ch;        //the last fused burst: NORAD number, channel 0-4
+    int    last_sat, last_ch;        //the last fused burst: NORAD number, channel (SOOP_RA_CH: Ring Alert)
     double last_y, last_sd;          //and its innovation, Hz
     double nis_avg;
     int    gps_valid;

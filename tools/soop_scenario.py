@@ -135,7 +135,7 @@ def make_iq(outdir, slots, seed, cn0_lo, cn0_hi, noise_counts, max_bursts=3, spu
             buf = [complex(rng.gauss(0, math.sqrt(0.5)), rng.gauss(0, math.sqrt(0.5)))
                    for _ in range(slot_len)]
             for _ in range(rng.randrange(max_bursts + 1)):
-                ch = sig.RING_ALERT_INDEX if rng.random() < 0.7 else rng.randrange(4)
+                ch = sig.RING_ALERT_INDEX if rng.random() < 0.7 else rng.choice((0, 2))
                 n_data = rng.randrange(120, 200)
                 mod = rng.choice(("dqpsk", "bpsk"))
                 ira = None
@@ -232,9 +232,9 @@ def make_rtl(outdir, seconds=0.6, seed=5, fc=1_626_000_000.0, fs=2_000_000.0, n_
     bursts = []
     slot = int(0.020 * fs)
     for k in range(n_bursts):
-        ch = sig.RING_ALERT_INDEX if k % 3 else 3
+        ch = sig.RING_ALERT_INDEX if k % 3 else 0
         f_rf = sig.SIMPLEX_CHANNELS[ch] + rng.uniform(-30_000.0, 30_000.0)
-        if ch == 3:                      #a messaging burst the Ring Alert band still holds
+        if ch == 0:                      #a burst one channel down the Ring Alert band still holds
             f_rf = sig.SIMPLEX_CHANNELS[ch] + rng.uniform(15_000.0, 30_000.0)
         cn0 = rng.uniform(56.0, 66.0)
         syms = burst_symbols(rng.randrange(120, 180), rng)
@@ -470,7 +470,7 @@ def make_obs(outdir, seed=1, gps_min=5.0, denial_min=15.0, speed=15.0, tle_age_d
                 d = [rs[k] - rr[k] for k in range(3)]
                 rho = math.sqrt(sum(c * c for c in d))
                 rdot = sum((vs[k] - vr[k]) * d[k] / rho for k in range(3))
-                ch = sig.RING_ALERT_INDEX if rng.random() < 0.5 else rng.randrange(4)
+                ch = sig.RING_ALERT_INDEX if rng.random() < 0.5 else rng.choice((0, 2))
                 f_ch = sig.SIMPLEX_CHANNELS[ch]
                 f_rx = f_ch + s["beta_hz"] - f_ch * rdot / sig.C_LIGHT
                 eps_t = tcxo0 + tempco_ppm * 1e-6 * temp + tcxo_walk
