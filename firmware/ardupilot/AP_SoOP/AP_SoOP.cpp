@@ -59,6 +59,10 @@ static const uint32_t GREEN_MS = 60;     //green after each fused burst
 static const uint32_t HEARD_MS = 40;     //blue brighter after each burst the DSP detects
 static const uint8_t DIM_ON = 1, FLASH_ON = 3;   //ms on in BLUE_ON_OF: both LEDs stay dim
 static const uint32_t STAGE_MS = 4000, STAGE_GAP_MS = 400;   //green's start-up count
+//orientation: bursts this strong decode as Ring Alert most of the time when the spectrum is the
+//right way up (2026-11-18 flights, swapped offline: 95 of 298 in a minute at cruise)
+static const float ORI_CN0 = 50.0f;
+static const uint16_t ORI_N = 60, ORI_LOCKED_N = 400;
 
 static AP_SoOP_MAX2112 tuner;
 static AP_SoOP_Capture capture;
@@ -365,6 +369,8 @@ void AP_SoOP::load_config()
         { "guard_hold_s", &_gcfg.hold_s }, { "guard_free_vel", &_gcfg.free_vel_sigma },
         { "ind_vel_sigma", &_gcfg.ind_vel_sigma },
         { "gps_lag_s", &c.gps_lag_s }, { "still_sigma", &c.still_sigma },
+        { "clkd_sigma", &c.clkd_sigma }, { "clkd_tau", &c.clkd_tau },
+        { "reacq_frac", &c.reacq_frac },
     };
     //no scanf here: ArduPilot's C library has none with floating point
     char *save = nullptr;
@@ -624,7 +630,10 @@ bool AP_SoOP::iq_setup()
     if (_iq_rec_s <= 0 && _iq_fast_mps <= 0) {
         return false;
     }
-    _iq_rec_bytes = _iq_bits == 16 ? 4 * SOOP_CAPTURE_BLOCK : 4 + SOOP_CAPTURE_BLOCK;
+    //each record starts with its capture block number (uint32), so a file says its own
+    //timeline: the SOD records of dropped blocks are droppable log messages, and 2026-11-18 lost
+    //a fifth of them (110 s of misplaced I/Q on the return flight)
+    _iq_rec_bytes = 4 + (_iq_bits == 16 ? 4 * SOOP_CAPTURE_BLOCK : 4 + SOOP_CAPTURE_BLOCK);
     for (uint32_t kb : IQ_RING_KB) {
         const uint32_t n = kb * 1024 / (_iq_rec_bytes + sizeof(iq_slot_t));
         if (n < 8) {
@@ -722,10 +731,12 @@ void AP_SoOP::iq_record(const int16_t *iq, uint64_t first_sample)
     uint8_t *rec;
     if ((s = iq_claim(&rec))) {
         s->kind = IQ_DATA;
+        const uint32_t blk = uint32_t(first_sample / SOOP_CAPTURE_BLOCK);
+        memcpy(rec, &blk, sizeof(blk));
         if (_iq_bits == 16) {
-            memcpy(rec, iq, _iq_rec_bytes);
+            memcpy(rec + 4, iq, 4 * SOOP_CAPTURE_BLOCK);
         } else {
-            soop_iq4_pack(iq, SOOP_CAPTURE_BLOCK, rec);
+            soop_iq4_pack(iq, SOOP_CAPTURE_BLOCK, rec + 4);
         }
         iq_commit();
     } else {
@@ -757,7 +768,7 @@ void AP_SoOP::iq_writer()
         __sync_synchronize();             //the slot's contents after seeing it committed
         const iq_slot_t *s = &_iq_slots[_iq_tail];
         uint32_t used = 1;
-        const char *ext = s->bits == 16 ? "bin" : "iq4";
+        const char *ext = s->bits == 16 ? "i16b" : "iq4b";   //b: block-numbered records
         switch (s->kind) {
         case IQ_OPEN:
             if (_iq_fd >= 0) {
@@ -782,7 +793,7 @@ void AP_SoOP::iq_writer()
             snprintf(path, sizeof(path), "%s/iq%04d.%s", SOOP_DIR, int(n), ext);
             _iq_fd = AP::FS().open(path, O_WRONLY | O_CREAT | O_TRUNC);
             if (_iq_fd >= 0) {
-                AP::logger().WriteStreaming("SOI", "TimeUS,N,S,T,Bits", "QHQdB", AP_HAL::micros64(),
+                AP::logger().Write("SOI", "TimeUS,N,S,T,Bits", "QHQdB", AP_HAL::micros64(),
                                             uint16_t(n), s->first_sample, s->t, s->bits);
                 n++;
                 _iq_since_sync = 0;
@@ -866,12 +877,32 @@ void AP_SoOP::run_block(const int16_t *iq, uint64_t first_sample)
         b.sigma = out[i].f_sigma_hz;
         b.cn0 = out[i].cn0_dbhz;
         b.sv = out[i].ira ? out[i].ra_sv : -1;
+        if (out[i].cn0_dbhz >= ORI_CN0) {
+            _ori_strong++;
+            _ori_ira += out[i].ira;
+        }
         if (out[i].ira) {
             AP::logger().WriteStreaming("SOR", "TimeUS,SV,Beam,X,Y,Z,Fix", "QBBhhhB", AP_HAL::micros64(),
                                         out[i].ra_sv, out[i].ra_beam, out[i].ra_pos[0],
                                         out[i].ra_pos[1], out[i].ra_pos[2], out[i].ra_fixed);
         }
         _bursts_s++;
+    }
+    //the wrong way up, Ring Alert sits outside the band searched and only its image (~25 dB
+    //down) and other channels' images come through, Doppler reversed: strong bursts and not one
+    //decoded is that, so turn the spectrum over. Once decodes have come, only a long silence moves it
+    if (!_replay && _ori_strong >= (_ori_locked ? ORI_LOCKED_N : ORI_N)) {
+        if (_ori_ira == 0) {
+            capture.set_swap(!capture.swapped());
+            _ori_locked = false;
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "SoOP: no Ring Alert decoded in %u strong bursts - I/Q %s",
+                          unsigned(_ori_strong), capture.swapped() ? "swapped" : "as wired");
+        } else {
+            _ori_locked = true;
+        }
+        AP::logger().WriteStreaming("SOW", "TimeUS,Swap,Strong,Ira,Lock", "QBHHB", AP_HAL::micros64(),
+                                    uint8_t(capture.swapped()), _ori_strong, _ori_ira, uint8_t(_ori_locked));
+        _ori_strong = _ori_ira = 0;
     }
     //bursts come out up to one simplex slot after their preamble
     const double newest = _t0 + (first_sample + SOOP_CAPTURE_BLOCK) / _fs;
