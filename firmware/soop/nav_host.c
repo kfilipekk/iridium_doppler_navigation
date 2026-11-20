@@ -126,7 +126,15 @@ int main(int argc, char **argv)
                 {"max_tle_age_d", &cfg.max_tle_age_d}, {"fix_max_hacc", &cfg.fix_max_hacc},
                 {"gps_sigma", &cfg.gps_sigma}, {"dut1", &cfg.dut1}, {"amb_ratio", &cfg.amb_ratio},
                 {"dt_sigma0", &cfg.dt_sigma0}, {"gps_lag_s", &cfg.gps_lag_s},
-                {"still_sigma", &cfg.still_sigma},
+                {"still_sigma", &cfg.still_sigma}, {"clkd_sigma", &cfg.clkd_sigma},
+                {"clkd_tau", &cfg.clkd_tau}, {"reacq_frac", &cfg.reacq_frac},
+                {"acq_span", &cfg.acq_span}, {"clkd_sigma0", &cfg.clkd_sigma0},
+                {"along0_m", &cfg.orbit[SOOP_ORBIT_TLE].along0_m},
+                {"along_m_per_day", &cfg.orbit[SOOP_ORBIT_TLE].along_m_per_day},
+                {"cross0_m", &cfg.orbit[SOOP_ORBIT_TLE].cross0_m},
+                {"cross_m_per_day", &cfg.orbit[SOOP_ORBIT_TLE].cross_m_per_day},
+                {"radial0_m", &cfg.orbit[SOOP_ORBIT_TLE].radial0_m},
+                {"radial_m_per_day", &cfg.orbit[SOOP_ORBIT_TLE].radial_m_per_day},
             };
             char key[32];
             double val;

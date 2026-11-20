@@ -22,6 +22,11 @@ void soop_nav_default_cfg(soop_nav_cfg_t *c)
     c->vel_sigma = 1.5;   c->vel_tau = 300.0;
     c->velz_sigma = 0.5;  c->velz_tau = 60.0;
     c->clk_q = 0.3;       c->clkd_q = 0.08;
+    //2026-11-18 flights: the walk let the drift run to -17 Hz/s and the clock to -160 kHz; a
+    //real TCXO moves under 1 Hz/s (25-33 Hz/degC, the board warming a few degrees a minute);
+    //0.3 Hz/s was too stiff for check_soop.py nav (65 false spoofing alarms)
+    c->clkd_sigma = 1.0;  c->clkd_tau = 600.0;
+    c->reacq_n = 80;      c->reacq_frac = 0.03;
     c->clk_sigma_acq = 60.0;
     c->clkd_sigma0 = 1.0;
     c->dt_sigma0 = 0.03;
@@ -176,7 +181,8 @@ static void base_init(soop_nav_t *nav, const double pos[3], double sigma, double
         nav->P[IV + i][IV + i] = 0.1 * 0.1;
     }
     nav->P[IC][IC] = c->acq_span * c->acq_span;
-    nav->P[ICD][ICD] = c->clkd_sigma0 * c->clkd_sigma0;
+    nav->P[ICD][ICD] = c->clkd_tau > 0.0 ? c->clkd_sigma * c->clkd_sigma
+                                         : c->clkd_sigma0 * c->clkd_sigma0;
     nav->P[IDT][IDT] = c->dt_sigma0 * c->dt_sigma0;
     nav->P[IBB][IBB] = c->baro_bias_sigma * c->baro_bias_sigma;
     nav->t = t;
@@ -281,22 +287,29 @@ static void step(soop_nav_t *nav, double dt, const double vned[3], double R[3][3
     for (int i = 0; i < 3; i++)
         for (int k = 0; k < 3; k++)
             Rdt[i][k] = R[i][k] * dt;
+    //the drift: Gauss-Markov when clkd_tau is set (it decays as ad, and the clock takes its
+    //integral g), else the old random walk (ad 1, g dt)
+    const int gm = c->clkd_tau > 0.0;
+    const double ad = gm ? exp(-dt / c->clkd_tau) : 1.0;
+    const double g = gm ? c->clkd_tau * (1.0 - ad) : dt;
 
     const double vt[3] = { vned[0] + x[IV], vned[1] + x[IV + 1], vned[2] + x[IV + 2] };
     for (int i = 0; i < 3; i++)
         x[IP + i] += dot3(R[i], vt) * dt;
     for (int k = 0; k < 3; k++)
         x[IV + k] *= a[k];
-    x[IC] += x[ICD] * dt;
+    x[IC] += x[ICD] * g;
+    x[ICD] *= ad;
     x[IBB] *= ab;
 
-    //p <- F P F^T, F = I except: p += R dt dv, dv *= a, c += dt cd, bb *= ab
+    //p <- F P F^T, F = I except: p += R dt dv, dv *= a, c += g cd, cd *= ad, bb *= ab
     for (int j = 0; j < n; j++) {                  //rows
         for (int i = 0; i < 3; i++)
             P[IP + i][j] += Rdt[i][0] * P[IV][j] + Rdt[i][1] * P[IV + 1][j] + Rdt[i][2] * P[IV + 2][j];
         for (int k = 0; k < 3; k++)
             P[IV + k][j] *= a[k];
-        P[IC][j] += dt * P[ICD][j];
+        P[IC][j] += g * P[ICD][j];
+        P[ICD][j] *= ad;
         P[IBB][j] *= ab;
     }
     for (int j = 0; j < n; j++) {                  //columns
@@ -305,18 +318,25 @@ static void step(soop_nav_t *nav, double dt, const double vned[3], double R[3][3
             r[IP + i] += Rdt[i][0] * r[IV] + Rdt[i][1] * r[IV + 1] + Rdt[i][2] * r[IV + 2];
         for (int k = 0; k < 3; k++)
             r[IV + k] *= a[k];
-        r[IC] += dt * r[ICD];
+        r[IC] += g * r[ICD];
+        r[ICD] *= ad;
         r[IBB] *= ab;
     }
     for (int k = 0; k < 3; k++) {
         const double s = k < 2 ? c->vel_sigma : c->velz_sigma;
         P[IV + k][IV + k] += s * s * (1.0 - a[k] * a[k]);
     }
-    const double qc = c->clk_q * c->clk_q, qd = c->clkd_q * c->clkd_q;
-    P[IC][IC] += qc * dt + qd * dt * dt * dt / 3.0;
-    P[IC][ICD] += qd * dt * dt / 2.0;
-    P[ICD][IC] += qd * dt * dt / 2.0;
-    P[ICD][ICD] += qd * dt;
+    const double qc = c->clk_q * c->clk_q;
+    if (gm) {
+        P[IC][IC] += qc * dt;
+        P[ICD][ICD] += c->clkd_sigma * c->clkd_sigma * (1.0 - ad * ad);
+    } else {
+        const double qd = c->clkd_q * c->clkd_q;
+        P[IC][IC] += qc * dt + qd * dt * dt * dt / 3.0;
+        P[IC][ICD] += qd * dt * dt / 2.0;
+        P[ICD][IC] += qd * dt * dt / 2.0;
+        P[ICD][ICD] += qd * dt;
+    }
     P[IBB][IBB] += c->baro_bias_sigma * c->baro_bias_sigma * (1.0 - ab * ab);
 }
 
@@ -803,6 +823,25 @@ static int pend_push(soop_nav_t *nav, soop_pend_t *list, int sat, double t, doub
     return 1;
 }
 
+//the clock is wrong: drop it, its drift and every satellite fitted under it, and search again
+static void lose_clock(soop_nav_t *nav)
+{
+    const soop_nav_cfg_t *c = &nav->cfg;
+    while (nav->n_track > 0)
+        drop_slot(nav, nav->n_track - 1);
+    for (int i = 0; i < nav->n; i++)
+        if (i != IC && i != ICD)
+            nav->P[IC][i] = nav->P[i][IC] = nav->P[ICD][i] = nav->P[i][ICD] = 0.0;
+    nav->x[IC] = nav->x[ICD] = 0.0;
+    nav->P[IC][IC] = c->acq_span * c->acq_span;
+    nav->P[ICD][ICD] = c->clkd_tau > 0.0 ? c->clkd_sigma * c->clkd_sigma
+                                         : c->clkd_sigma0 * c->clkd_sigma0;
+    nav->P[IC][ICD] = nav->P[ICD][IC] = 0.0;
+    nav->have_clock = 0;
+    nav->n_acq = 0;
+    nav->n_reacq++;
+}
+
 //clock acquisition
 static int acquire(soop_nav_t *nav)
 {
@@ -834,7 +873,7 @@ static int acquire(soop_nav_t *nav)
                 return 0;
             }
         }
-        double sum = 0.0;
+        double sum = 0.0, gsum[3] = { 0.0, 0.0, 0.0 };
         int cnt = 0;
         for (int b = 0; b < nav->n_acq; b++) {
             const soop_acq_t *a = &nav->acq[b];
@@ -859,17 +898,31 @@ static int acquire(soop_nav_t *nav)
                             hist[k]++;
                     } else if (k == kpk || k == kpk + 1) {
                         sum += p.y;
+                        for (int i = 0; i < 3; i++)
+                            gsum[i] += p.h.val[i];        //predict() puts d h / d position first
                         cnt++;
                     }
                 }
             }
         }
         if (pass == 1) {
+            //the clock was read against the position as it stands, so it carries that
+            //position's error: c_err = -g . p_err, g the mean d h / d position of the bursts it
+            //came from. Keep the link, or a wrong start becomes a confident wrong clock
+            //(Castle Mound 2026-11-17: a start 2.7 km out sat 15 km off at hacc 2.4 km)
+            double gm[3], gP[3];
+            for (int i = 0; i < 3; i++)
+                gm[i] = gsum[i] / cnt;
+            for (int i = 0; i < 3; i++)
+                gP[i] = gm[0] * nav->P[IP][IP + i] + gm[1] * nav->P[IP + 1][IP + i]
+                      + gm[2] * nav->P[IP + 2][IP + i];
             nav->x[IC] = sum / cnt;
-            nav->P[IC][IC] = c->clk_sigma_acq * c->clk_sigma_acq;
             for (int i = 0; i < nav->n; i++)
                 if (i != IC)
                     nav->P[IC][i] = nav->P[i][IC] = 0.0;
+            nav->P[IC][IC] = c->clk_sigma_acq * c->clk_sigma_acq + dot3(gP, gm);
+            for (int i = 0; i < 3; i++)
+                nav->P[IC][IP + i] = nav->P[IP + i][IC] = -gP[i];
             nav->have_clock = 1;
             nav->n_acq = 0;
             return 1;
@@ -966,6 +1019,17 @@ done:
             nav->sv_votes[sv]++;
         } else {
             nav->sv_votes[sv]--;
+        }
+    }
+    if (nav->have_clock && !nav->clk_from_prior && res != SOOP_B_NO_TIME && res != SOOP_B_ACQUIRING) {
+        //a clock fitted to the wrong bursts keeps matching nothing, and nothing then corrects
+        //it (2026-11-18: 1% fused for hours): count, and start the search again
+        nav->win_bursts++;
+        nav->win_fused += res == SOOP_B_FUSED;
+        if (nav->win_bursts >= (uint32_t)c->reacq_n || fabs(nav->x[IC]) > c->acq_span) {
+            if (nav->win_fused < c->reacq_frac * nav->win_bursts || fabs(nav->x[IC]) > c->acq_span)
+                lose_clock(nav);
+            nav->win_bursts = nav->win_fused = 0;
         }
     }
     if (nav->clk_from_prior && res != SOOP_B_NO_TIME) {

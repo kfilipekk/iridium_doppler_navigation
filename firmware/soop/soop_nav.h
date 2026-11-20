@@ -31,6 +31,10 @@ typedef struct {
     double velz_sigma, velz_tau;     //and vertical
     double clk_q;                    //TCXO frequency walk at the carrier, Hz/sqrt(s)
     double clkd_q;                   //its drift's walk, Hz/s/sqrt(s)
+    double clkd_sigma, clkd_tau;     //the drift is Gauss-Markov: a TCXO's frequency only drifts
+                                     //as fast as its temperature moves (19 Hz/degC), and back
+    int    reacq_n;                  //this many bursts with almost none fused: the clock is lost
+    double reacq_frac;               //"almost none"
     double clk_sigma_acq;            //clock uncertainty after acquisition, Hz
     double clkd_sigma0;              //Hz/s
     double dt_sigma0;                //GPS time-tag error, s
@@ -119,6 +123,7 @@ typedef struct {
     double nis_avg;
     int    gps_valid;
     uint32_t count[SOOP_B_N], n_resets, n_acq_tries;
+    uint32_t win_bursts, win_fused, n_reacq;   //the lost-clock watch
 
     //Iridium's own satellite numbers, as decoded Ring Alerts carry them, learnt against the
     //catalogue from bursts that associate without them
