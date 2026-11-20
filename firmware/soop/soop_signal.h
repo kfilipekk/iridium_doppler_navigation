@@ -4,7 +4,10 @@
 #define SOOP_SYMBOL_RATE     25000.0      //symbols/s
 #define SOOP_CH_SPACING      41666.667    //Hz between simplex channels
 #define SOOP_F_RING_ALERT    1626270833.0 //Hz, Ring Alert (IRA)
-#define SOOP_N_SIMPLEX       5            //four messaging channels below Ring Alert
+#define SOOP_N_SIMPLEX       3            //Ring Alert and the channel either side: what the
+#define SOOP_RA_CH           1            //+-52 kHz the DSP searches holds (2026-11-20: bursts on
+                                          //RA+41.7 kHz and RA-41.7 kHz; the messaging channels are
+                                          //above Ring Alert, not below)
 #define SOOP_PREAMBLE_SYMS   64           //downlink carrier preamble
 #define SOOP_MAX_BURST_S     0.02032      //the simplex slot
 

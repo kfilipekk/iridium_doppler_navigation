@@ -38,7 +38,9 @@ void soop_nav_default_cfg(soop_nav_cfg_t *c)
     c->orbit[SOOP_ORBIT_OPERATOR] = (soop_orbit_err_t){ 50.0, 150.0, 20.0, 10.0, 20.0, 10.0 };
     c->max_tle_age_d = 7.0;
     c->gps_sigma = 3.0;
-    c->sig_floor = 1.0;
+    c->sig_floor = 1.0;   //real bursts want ~12 (soop.cfg sig_floor): the DSP puts some at
+                          //0-3 Hz that are 10-17 Hz against the truth (2026-11-20); the
+                          //simulated ones in check_soop.py nav are that clean
     c->gate = 5.0;
     c->amb_ratio = 9.0;
     c->confirm_n = 3;     c->confirm_s = 40.0;  c->confirm_spread = 40.0;
@@ -101,7 +103,7 @@ static double norm3(const double *a) { return sqrt(dot3(a, a)); }
 
 static double f_channel(int ch)
 {
-    return SOOP_F_RING_ALERT - (double)(SOOP_N_SIMPLEX - 1 - ch) * SOOP_CH_SPACING;
+    return SOOP_F_RING_ALERT + (double)(ch - SOOP_RA_CH) * SOOP_CH_SPACING;
 }
 
 //time
@@ -974,7 +976,7 @@ int soop_nav_burst(soop_nav_t *nav, double t_board, double f_hz, double sigma_hz
         //the burst names its satellite: keep only that one
         int m = 0;
         for (int i = 0; i < nc; i++)
-            if (cd[i].sat == nav->sv_sat[sv] - 1 && cd[i].ch == SOOP_N_SIMPLEX - 1)
+            if (cd[i].sat == nav->sv_sat[sv] - 1 && cd[i].ch == SOOP_RA_CH)
                 cd[m++] = cd[i];
         if (m == 0) {
             res = SOOP_B_REJECTED;                //the one it names does not fit: trust neither
