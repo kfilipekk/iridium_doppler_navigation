@@ -17,6 +17,9 @@ analysis tools (soop_truth.py) work from this instead. Arrays, all on board time
   soi   t, file, first_sample, board_t                  (I/Q file starts)
   sod   t, first_sample                                 (I/Q blocks the recorder dropped)
   sog   every SOG field                                 (capture gaps the DSP saw)
+  sow   t, swap, strong, ira, lock                      (the spectrum orientation check)
+  sor   t, sv, beam                                     (Ring Alerts decoded on board)
+  soq   t, queued, dropped, written                     (the I/Q recorder's counters)
 """
 import os
 import sys
@@ -30,10 +33,10 @@ IMU_DEC = 2         #400 Hz -> 200 Hz, averaged: a point sample of every 4th ali
 def extract(path):
     from pymavlink import mavutil
     m = mavutil.mavlink_connection(path)
-    out = {k: [] for k in ("gps", "sob", "sos", "sof", "imu", "imu1", "baro", "xkf", "soi", "sod", "sog")}
+    out = {k: [] for k in ("gps", "sob", "sos", "sof", "imu", "imu1", "baro", "xkf", "soi", "sod", "sog", "sow", "sor", "soq")}
     hacc = sacc = np.nan
     acc_imu = {0: [], 1: []}
-    want = ["GPS", "GPA", "SOB", "SOS", "SOF", "IMU", "BARO", "XKF1", "SOI", "SOD", "SOG"]
+    want = ["GPS", "GPA", "SOB", "SOS", "SOF", "IMU", "BARO", "XKF1", "SOI", "SOD", "SOG", "SOW", "SOR", "SOQ"]
     while True:
         x = m.recv_match(type=want)
         if x is None:
@@ -70,6 +73,12 @@ def extract(path):
             out["soi"].append((t, x.N, x.S, x.T))
         elif k == "SOD":
             out["sod"].append((t, x.S))
+        elif k == "SOW":
+            out["sow"].append((t, x.Swap, x.Strong, x.Ira, x.Lock))
+        elif k == "SOR":
+            out["sor"].append((t, x.SV, x.Beam))
+        elif k == "SOQ":
+            out["soq"].append((t, x.Q, x.D, x.W))
         elif k == "SOG":
             out["sog"].append(tuple(float(getattr(x, f)) for f in x.get_fieldnames()))
     return {k: np.array(v, dtype=float) for k, v in out.items()}

@@ -6,14 +6,16 @@ Usage:
 
 LOG.npz is soop_extract.py's: SOI says where each iqNNNN file starts (capture sample and board
 time), SOD which blocks the recorder dropped and SOG where the capture itself skipped. Each file
-is laid back on the capture's sample timeline - dropped and skipped blocks as zeros - so every
+(.iq4, as recorded to 2026-11-20) is laid back on the capture's sample timeline - dropped and skipped blocks as zeros - so every
 burst dsp_host finds gets its board time exactly: SOI.T + sample / SOOP_FS. SOD is written as a
 streaming (droppable) log message and the logger drops some under load - 2026-11-18: 13406 of
 60982 on the return flight, 110 s in all - so the recorder's own cumulative counter (SOQ.D, 1 Hz)
 says how many really went in each second; the unlogged ones are put beside that second's logged
 ones (drops come in runs, while the card stalls), or at its start. --swap exchanges I
 and Q first: Rev E's spectrum comes out mirrored about the LO (2026-11-20, every session so far),
-which hides Ring Alert from the DSP. The csv adds t (board s) and the file number to dsp_host's.
+which hides Ring Alert from the DSP. Block-numbered files (.iq4b/.i16b, firmware since
+f93b386) carry their own timeline and are already the right way up unless SOW says otherwise:
+leave --swap off for them. The csv adds t (board s) and the file number to dsp_host's.
 """
 import argparse
 import csv
@@ -65,9 +67,31 @@ def unlogged_drops(soq, sod, t_of):
     return edges, np.maximum(counted - logged, 0).astype(int)
 
 
+def numbered_file(path, t_s0, s0, swap, out_path):
+    """A .iq4b/.i16b file: every record carries its capture block, so the timeline is the file's
+    own - no SOD or SOQ needed. Missing blocks become zeros."""
+    sys.path.insert(0, HERE)
+    import soop_iq
+    blocks, iq = soop_iq.read(path)
+    if swap:
+        iq = iq[..., ::-1]
+    b0 = int(s0 // BLK)
+    full = np.zeros((int(blocks[-1]) - b0 + 1, BLK, 2), np.int16)
+    keep = blocks >= b0
+    full[blocks[keep] - b0] = iq[keep]
+    full.tofile(out_path)
+    return f"{len(blocks)} recorded, {len(full) - keep.sum()} missing (block numbers)"
+
+
 def one_file(args):
     k, soi, sod, sog, soq, iq_dir, swap, tmpdir = args
     fno, t_s0 = int(soi[k, 1]), float(soi[k, 3])
+    for ext in ("iq4b", "i16b"):
+        path = os.path.join(iq_dir, "iq%04d.%s" % (fno, ext))
+        if os.path.exists(path):
+            out_path = os.path.join(tmpdir, "f%04d.bin" % fno)
+            note = numbered_file(path, t_s0, int(soi[k, 2]), swap, out_path)
+            return k, run_dsp(out_path, t_s0, fno), note
     path = os.path.join(iq_dir, "iq%04d.iq4" % fno)
     if not os.path.exists(path):
         return k, [], "missing"
@@ -117,13 +141,17 @@ def one_file(args):
                 in_run = False
             s += BLK
     note = f"{n_rec} recorded, {n_zero} zero-filled ({n_late} from the counter), {n_rec - r} left over"
+    return k, run_dsp(out_path, t_s0, fno), note
+
+
+def run_dsp(out_path, t_s0, fno):
     res = subprocess.run([DSP_HOST, out_path], capture_output=True, text=True)
     os.remove(out_path)
     rows = list(csv.DictReader(res.stdout.splitlines()))
     for row in rows:
         row["t"] = "%.6f" % (t_s0 + float(row["t_sample"]) / FS)
         row["file"] = str(fno)
-    return k, rows, note
+    return rows
 
 
 def main():
