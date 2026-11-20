@@ -19,6 +19,7 @@ clock is taken at the roll from the truth tool's track (GPS-assisted, before the
 --no-doppler is the INS alone, for comparison.
 """
 import argparse
+import collections
 import csv
 import math
 import sys
@@ -31,9 +32,9 @@ import soop_truth as T
 OMEGA = 7.292115e-5
 A_E, F_E = 6378137.0, 1 / 298.257223563
 E2 = F_E * (2 - F_E)
-# state: dp(3, NED m) dv(3) phi(3) bg(3) ba(3) clk dclk
-IP, IV, IA, IBG, IBA, IC, ID = 0, 3, 6, 9, 12, 15, 16
-NB = 17                    #base states; then per tracked satellite: transmit offset beta (Hz)
+# state: dp(3, NED m) dv(3) phi(3) bg(3) ba(3) clk dclk, cabin-schedule height bias
+IP, IV, IA, IBG, IBA, IC, ID, IHB = 0, 3, 6, 9, 12, 15, 16, 17
+NB = 18                    #base states; then per tracked satellite: transmit offset beta (Hz)
 NSLOT = 14                 #and along-track timing tau (s), old elements put it km off its path
 NX = NB + 2 * NSLOT
 
@@ -93,11 +94,14 @@ class INS:
         P[IBA:IBA + 3, IBA:IBA + 3] = np.eye(3) * a.ba0 ** 2
         P[IC, IC] = 60.0 ** 2
         P[ID, ID] = 1.0 ** 2
+        P[IHB, IHB] = a.cab_bias_sigma ** 2
         self.P = P
+        self.hb = 0.0
         self.a = a
         self.Facc = np.zeros((NX, NX))
         self.tacc = 0.0
         self.q_rot = self.q_jerk = 0.0
+        self.qscale = 1.0                  #innovation-based adaptation of the motion noise
         self.slot_sat = [-1] * NSLOT
         self.slot_heard = [-1e9] * NSLOT
         self.x = np.zeros(NX)              #the satellite states live here; the base is applied
@@ -132,6 +136,7 @@ class INS:
         F[IA:IA + 3, IBG:IBG + 3] = self.C
         F[IC, ID] = 1.0
         F[ID, ID] = -1.0 / self.a.clkd_tau
+        F[IHB, IHB] = -1.0 / self.a.cab_bias_tau
         self.Facc += F * dt
         self.tacc += dt
         #gyro scale factor and axis misalignment: attitude error grows with the angle turned, so
@@ -147,14 +152,15 @@ class INS:
             return
         Phi = np.eye(NX) + self.Facc
         Q = np.zeros(NX)
-        Q[IV:IV + 3] = self.a.vrw ** 2 * dt
-        Q[IA:IA + 3] = self.a.arw ** 2 * dt + self.q_rot
+        Q[IV:IV + 3] = self.a.vrw ** 2 * dt * self.qscale
+        Q[IA:IA + 3] = (self.a.arw ** 2 * dt + self.q_rot) * self.qscale
         Q[IV:IV + 3] += self.q_jerk
         self.q_rot = self.q_jerk = 0.0
         Q[IBG:IBG + 3] = self.a.bg_rw ** 2 * dt
         Q[IBA:IBA + 3] = self.a.ba_rw ** 2 * dt
         Q[IC] = 0.3 ** 2 * dt
         Q[ID] = self.a.clkd_sigma ** 2 * 2 * dt / self.a.clkd_tau
+        Q[IHB] = self.a.cab_bias_sigma ** 2 * 2 * dt / self.a.cab_bias_tau
         for k in range(NSLOT):
             if self.slot_sat[k] >= 0:
                 Q[NB + 2 * k] = self.a.beta_rw ** 2 * dt
@@ -181,6 +187,7 @@ class INS:
         self.ba += dx[IBA:IBA + 3]
         self.clk += dx[IC]
         self.dclk += dx[ID]
+        self.hb += dx[IHB]
         self.x[NB:] += dx[NB:]
 
     def slot(self, sat, t, make):
@@ -222,6 +229,21 @@ def main():
     ap.add_argument("npz"); ap.add_argument("tle"); ap.add_argument("bursts"); ap.add_argument("truth")
     ap.add_argument("--lag", type=float, default=-0.02)
     ap.add_argument("--alt-sigma", type=float, default=0.0)
+    ap.add_argument("--alt-bias", type=float, default=0.0, help="m, added to the stand-in altitude")
+    ap.add_argument("--cabin-baro", help="another flight's .npz to fit the cabin pressurisation schedule on")
+    ap.add_argument("--cabin-min", type=float, default=600.0, help="m of cabin altitude below which it says nothing")
+    ap.add_argument("--cabin-floor", action="store_true", help="below it, bound the aircraft between the ground and there")
+    ap.add_argument("--cab-bias-sigma", type=float, default=700.0, help="the schedule's height offset, m (a state)")
+    ap.add_argument("--cabin-rate", type=float, default=0.0, help="m/s of cabin descent below which its rate says nothing (0 = off)")
+    ap.add_argument("--cab-bias-tau", type=float, default=1800.0)
+    ap.add_argument("--cab-white", type=float, default=100.0, help="m, the reading's own noise")
+    ap.add_argument("--vd-bound", type=float, default=0.0, help="m/s: an airliner's vertical speed, as a weak constraint (0 = off)")
+    ap.add_argument("--zupt", action="store_true", help="zero velocity whenever the IMU is still (after landing)")
+    ap.add_argument("--zupt-speed", type=float, default=15.0, help="m/s: only while the INS's own speed is under this")
+    ap.add_argument("--adapt", action="store_true", help="innovation-based adaptive motion noise (use with --widen 1)")
+    ap.add_argument("--adapt-n", type=int, default=60, help="bursts the NIS is averaged over")
+    ap.add_argument("--adapt-target", type=float, default=1.0)
+    ap.add_argument("--adapt-max", type=float, default=100.0)
     ap.add_argument("--no-doppler", action="store_true")
     ap.add_argument("--sig", type=float, default=20.0, help="Doppler noise floor, Hz")
     ap.add_argument("--gate", type=float, default=5.0)
@@ -234,6 +256,13 @@ def main():
     ap.add_argument("--ba-rw", type=float, default=2e-4)     #m/s^2/sqrt(s)
     ap.add_argument("--bg0", type=float, default=0.004)
     ap.add_argument("--gyro-sf", type=float, default=0.02, help="attitude error per radian turned")
+    ap.add_argument("--gyro-temp", action="store_true", help="feed the gyro bias forward with temperature")
+    ap.add_argument("--widen", type=float, default=2.0, help="covariance factor when most bursts fail the gate (1 = off)")
+    ap.add_argument("--chans", default="-1,0,1", help="channels matched, offsets from Ring Alert")
+    ap.add_argument("--both-imus", action="store_true", help="average IMU 0 and IMU 1")
+    ap.add_argument("--cap-pos", type=float, default=1e12, help="widening stops at this sigma, m (off: a 5 km cap kept the outbound descent from recovering)")
+    ap.add_argument("--cap-vel", type=float, default=1e12, help="m/s")
+    ap.add_argument("--cap-att", type=float, default=1e12, help="rad")
     ap.add_argument("--acc-sf", type=float, default=0.05)
     ap.add_argument("--ba0", type=float, default=0.15)
     ap.add_argument("--clkd-sigma", type=float, default=1.0)
@@ -251,6 +280,13 @@ def main():
 
     D = np.load(a.npz)
     imu, gps = D["imu"], D["gps"]
+    if a.both_imus and "imu1" in D:
+        #the ICM-42605 beside the ICM-45686, on the same axes: their mean halves the noise they
+        #do not share (biases they share, like a boot calibration done moving, stay)
+        b = D["imu1"]
+        imu = imu.copy()
+        for j in range(1, 8):
+            imu[:, j] = 0.5 * (imu[:, j] + np.interp(imu[:, 0], b[:, 0], b[:, j]))
     to_utc, _, _ = T.time_map(gps, a.lag)
     good = (gps[:, 1] >= 3) & (gps[:, 2] >= 6) & (gps[:, 9] < 5.0)
     G = gps[good]
@@ -282,6 +318,26 @@ def main():
         raise SystemExit("no still moment before the roll")
     fm = imu[best, 4:7].mean(0)
     bg = imu[best, 1:4].mean(0)
+    #the gyro bias against temperature, from every still 20 s before the start (GPS still
+    #there): MEMS bias walks ~0.002-0.006 deg/s/degC, and the board warms 20-30 degC in a bag
+    kT = np.zeros(3)
+    T0 = float(imu[best, 7].mean())
+    if a.gyro_temp:
+        rows_ = []
+        for s_ in np.arange(imu[0, 0] + 30, ts, 20.0):
+            kk_ = (imu[:, 0] > s_) & (imu[:, 0] <= s_ + 20)
+            kg_ = (te > s_) & (te <= s_ + 20)
+            if kk_.sum() < 1000 or not kg_.any() or G[kg_, 6].max() > 0.3:
+                continue
+            if imu[kk_, 1:4].std(0).max() < 0.01:
+                rows_.append((*imu[kk_, 1:4].mean(0), imu[kk_, 7].mean()))
+        rows_ = np.array(rows_)
+        if len(rows_) >= 6 and np.ptp(rows_[:, 3]) > 3.0:
+            A_ = np.column_stack([rows_[:, 3] - T0, np.ones(len(rows_))])
+            for ax in range(3):
+                kT[ax] = np.linalg.lstsq(A_, rows_[:, ax], rcond=None)[0][0]
+        print(f"gyro bias temperature slope {np.round(np.degrees(kT), 4)} deg/s/degC from {len(rows_)} still "
+              f"windows over {np.ptp(rows_[:, 3]) if len(rows_) else 0:.1f} degC")
     roll = math.atan2(-fm[1], -fm[2])
     pitch = math.atan2(fm[0], math.hypot(fm[1], fm[2]))
     C = euler_to_C(roll, pitch, 0.0)
@@ -302,6 +358,27 @@ def main():
           f"wheels off {t_off:.1f}; gyro bias {np.round(bg, 4)}; attitude r {math.degrees(roll):.0f} "
           f"p {math.degrees(pitch):.0f}, heading offset {math.degrees(yaw):.0f} deg; roll accel "
           f"{np.linalg.norm(a_ned):.2f} m/s2, levelled f {np.linalg.norm(f_lv):.2f}")
+    #the cabin barometer, through the pressurisation schedule: fitted on ANOTHER flight (its
+    #u-blox height against its cabin), so nothing of this flight's truth goes in. Above ~600 m
+    #cabin the schedule is near linear (2026-11-18/19: 737 and A320 alike); below it the cabin
+    #sits at the field while the aircraft is still kilometres up, so it says nothing there
+    cab_map = None
+    if a.cabin_baro:
+        Dx = np.load(a.cabin_baro)
+        bx, gx = Dx["baro"], Dx["gps"]
+        okx = gx[:, 1] >= 3
+        hx = np.interp(bx[:, 0], gx[okx, 0], gx[okx, 5])
+        cx = 44330.8 * (1 - (bx[:, 2] / 101325.0) ** 0.190263)
+        kx = (cx > a.cabin_min) & (bx[:, 0] > gx[okx, 0][0]) & (bx[:, 0] < gx[okx, 0][-1])
+        A_ = np.column_stack([cx[kx], np.ones(kx.sum())])
+        coef = np.linalg.lstsq(A_, hx[kx], rcond=None)[0]
+        sd = float(np.std(hx[kx] - A_ @ coef))
+        cab_map = (coef[0], coef[1], max(sd * 1.5, 300.0))
+        print(f"cabin baro: aircraft height = {coef[0]:.2f} x cabin + {coef[1]:.0f} m, fitted on another "
+              f"flight (sd {sd:.0f} m), used at sigma {cab_map[2]:.0f} m above {a.cabin_min:.0f} m cabin")
+    baro = D["baro"]
+    cab_alt = 44330.8 * (1 - (baro[:, 2] / 101325.0) ** 0.190263)
+
     TR = np.load(a.truth)
     ck = TR["clock_track"]
     okc = ck[:, 2] >= 2 * np.maximum(ck[:, 3], 1)
@@ -311,6 +388,7 @@ def main():
     ins = INS(math.radians(G[iS, 3]), math.radians(G[iS, 4]), G[iS, 5] + 45.0, np.zeros(3),
               euler_to_C(0, 0, yaw) @ euler_to_C(roll, pitch, 0.0), bg, clk0, a)
     t0, i0 = ts, iS
+    bg_ff = lambda temp: kT * (temp - T0)          #added to the measured rate's bias
 
     #bursts after the roll starts, with every satellite's state at each
     rows = list(csv.DictReader(open(a.bursts)))
@@ -322,7 +400,7 @@ def main():
     SR, SV = T.sat_ecef(sats, to_utc(B[:, 0]))
     SR2, SV2 = T.sat_ecef(sats, to_utc(B[:, 0]) + 0.5)
     #each satellite's Doppler rate comes from the filter's own position, burst by burst
-    chans = (-1, 0, 1)
+    chans = tuple(int(c) for c in a.chans.split(","))
 
     #events: GPS (1 Hz, until wheels-off), height (1 Hz), bursts
     ev = []
@@ -333,6 +411,10 @@ def main():
             ev.append((te[i], 0, i))
         elif i % 5 == 0 and a.alt_sigma > 0:
             ev.append((te[i], 1, i))
+        elif i % 5 == 0 and cab_map is not None:
+            ev.append((te[i], 3, i))
+        if i % 5 == 0 and te[i] > t_off and a.vd_bound > 0:
+            ev.append((te[i] + 1e-3, 4, i))
     for j in range(len(B)):
         ev.append((B[j, 0], 2, j))
     ev.sort()
@@ -341,12 +423,30 @@ def main():
     next_fix = t_off
     stats = dict(fused=0, gated=0, amb=0)
     anchor, next_tc = None, t_off
+    wbuf, fbuf, last_z = collections.deque(maxlen=400), collections.deque(maxlen=400), -1e9
+    cab_high = [False]
+    nis_hist, next_ad, qs_log = collections.deque(maxlen=a.adapt_n), t_off, []
+    recent, last_widen = collections.deque(maxlen=60), -1e9
+    assoc = []
     for ri, r in enumerate(ims):
         dt = r[0] - last_t
         last_t = r[0]
         if dt <= 0 or dt > 0.5:
             continue
-        ins.mech(r[1:4], r[4:7], dt)
+        ins.mech(r[1:4] - bg_ff(r[7]), r[4:7], dt)
+        #the IMU still (the board's own detector, AP_SoOP.cpp: gyro and |f| steady): the vehicle
+        #is parked - after landing, at the gate - and its velocity is zero
+        if a.zupt and r[0] > t_off:
+            wbuf.append(float(np.linalg.norm(r[1:4]))); fbuf.append(float(np.linalg.norm(r[4:7])))
+            #an IMU alone cannot tell a parked aircraft from smooth cruise (3,086 false zero-
+            #velocity updates at 240 m/s): only where the INS itself says it is slow
+            if len(wbuf) == wbuf.maxlen and r[0] - last_z > 0.5 and max(wbuf) < 0.03 \
+                    and math.hypot(ins.v[0], ins.v[1]) < a.zupt_speed \
+                    and abs(np.mean(fbuf) - 9.80665) < 0.3 and np.std(fbuf) < 0.05:
+                H = np.zeros((3, NX)); H[:, IV:IV + 3] = np.eye(3)
+                ins.update(H, -ins.v.copy(), np.eye(3) * 0.05 ** 2)
+                last_z = r[0]
+                stats["zupt"] = stats.get("zupt", 0) + 1
         while ei < len(ev) and ev[ei][0] <= r[0]:
             t, kind, i = ev[ei]; ei += 1
             if kind == 0:                                 #u-blox position + velocity
@@ -357,9 +457,45 @@ def main():
                 dv = np.array([vn[i], ve[i], G[i, 8]]) - ins.v
                 H = np.zeros((6, NX)); H[0:3, IP:IP + 3] = np.eye(3); H[3:6, IV:IV + 3] = np.eye(3)
                 ins.update(H, np.r_[dp, dv], np.diag([3.0 ** 2] * 3 + [0.2 ** 2] * 3))
+            elif kind == 3:                              #cabin barometer, through the schedule
+                c_ = float(np.interp(t, baro[:, 0], cab_alt))
+                H = np.zeros((1, NX)); H[0, IP + 2] = 1.0
+                if c_ > a.cabin_min:
+                    cab_high[0] = True
+                    #the schedule's error is one offset for minutes on end (a 737 is not an
+                    #A320), so it is a state - as white noise, a minute of it claimed +-90 m
+                    #while 2-4 km out: z = h + bias + noise
+                    H[0, IHB] = -1.0
+                    y = np.array([-(cab_map[0] * c_ + cab_map[1] + 45.0 - ins.h) + ins.hb])
+                    ins.update(H, y, np.array([[a.cab_white ** 2]]))
+                elif a.cabin_rate > 0 and cab_high[0]:
+                    #only on the way down: just after take-off the cabin dips as pressurisation
+                    #starts (A320, 2026-11-19), which would read as the aircraft descending
+                    #below the schedule's linear part the cabin may still be descending with the
+                    #aircraft (737: 650 -> 210 m while it came down 2.7 km) or sit at the field
+                    #(A320): its rate, when it moves, gives the vertical speed at ~1/slope
+                    kk_ = (baro[:, 0] > t - 20) & (baro[:, 0] <= t)
+                    if kk_.sum() > 20:
+                        rc = np.polyfit(baro[kk_, 0] - t, cab_alt[kk_], 1)[0]   #m/s, + up
+                        if rc < -a.cabin_rate:
+                            Hv = np.zeros((1, NX)); Hv[0, IV + 2] = 1.0
+                            vd_meas = -cab_map[0] * rc                    #down positive
+                            ins.update(Hv, np.array([vd_meas - ins.v[2]]),
+                                       np.array([[(0.5 * vd_meas) ** 2 + 2.0 ** 2]]))
+                elif a.cabin_floor:
+                    #the cabin down at the field: the aircraft is somewhere below where the
+                    #schedule leaves it, no more - a bound, which an unstable vertical channel needs
+                    top = cab_map[0] * a.cabin_min + cab_map[1]
+                    y = np.array([-(0.5 * top + 45.0 - ins.h)])
+                    ins.update(H, y, np.array([[(0.5 * top) ** 2]]))
+            elif kind == 4:                              #the airliner envelope: |vd| well under 15 m/s
+                H = np.zeros((1, NX)); H[0, IV + 2] = 1.0
+                ins.update(H, np.array([-ins.v[2]]), np.array([[a.vd_bound ** 2]]))
             elif kind == 1:
                 H = np.zeros((1, NX)); H[0, IP + 2] = 1.0
-                y = np.array([-(G[i, 5] + 45.0 + np.random.default_rng(i).normal(0, a.alt_sigma) - ins.h)])
+                #the u-blox height standing in for air data: noise, and the bias a pressure
+                #altitude carries (the weather: QNH against the ISA, up to ~200 m)
+                y = np.array([-(G[i, 5] + 45.0 + a.alt_bias + np.random.default_rng(i).normal(0, a.alt_sigma) - ins.h)])
                 ins.update(H, y, np.array([[a.alt_sigma ** 2]]))
             elif not a.no_doppler:
                 rr = ins.ecef()
@@ -395,17 +531,34 @@ def main():
                         else:                             #not yet tracked: its priors as noise
                             Rc = Rc + a.beta0 ** 2 + (rate_i[s] * a.tau0) ** 2
                         yv = B[i, 1] - pred
-                        cands.append((ins.nis(H, np.array([yv]), Rc), H, yv, s, k, Rc))
+                        cands.append((ins.nis(H, np.array([yv]), Rc), H, yv, s, k, Rc, ch))
                 if not cands:
                     continue
                 cands.sort(key=lambda c: c[0])
+                nis_hist.append(min(cands[0][0], a.gate ** 2))
                 if cands[0][0] > a.gate ** 2:
                     stats["gated"] += 1
+                    recent.append(0)
+                    #most bursts failing the gate means the filter is wrong about itself, not the
+                    #sky: widen it so the bursts that would correct it get through again
+                    if len(recent) >= 30 and sum(list(recent)[-30:]) < 9 and B[i, 0] - last_widen > 10:
+                        #by a factor, but never past a ceiling: compounded, widening alone
+                        #once let the outbound filter believe itself anywhere within 1,500 km
+                        caps = ((slice(IP, IP + 3), a.cap_pos), (slice(IV, IV + 3), a.cap_vel),
+                                (slice(IA, IA + 3), a.cap_att))
+                        for blk, cap in caps:
+                            sd = math.sqrt(max(np.diag(ins.P)[blk].max(), 1e-12))
+                            f = min(a.widen, cap / sd) if sd < cap else 1.0
+                            if f > 1.0:
+                                g_ = math.sqrt(f)
+                                ins.P[blk, :] *= g_; ins.P[:, blk] *= g_
+                        last_widen = B[i, 0]
+                        stats["widened"] = stats.get("widened", 0) + 1
                     continue
                 if len(cands) > 1 and cands[1][0] < a.amb * max(cands[0][0], 1.0):
                     stats["amb"] += 1
                     continue
-                _, H, yv, s_, k, Rc = cands[0]
+                _, H, yv, s_, k, Rc, ch_ = cands[0]
                 if k < 0:                                 #a new satellite: give it its states
                     k = ins.slot(s_, B[i, 0], True)
                     o = NB + 2 * k
@@ -414,6 +567,8 @@ def main():
                 ins.slot_heard[k] = B[i, 0]
                 ins.update(H, np.array([yv]), Rc)
                 stats["fused"] += 1
+                recent.append(1)
+                assoc.append((B[i, 0], int(norad[s_]), ch_))
         if r[0] >= t_off and anchor is None:
             anchor = (ins.clk, float(r[7]))
         if anchor is not None and a.clk_temp > 0 and r[0] >= next_tc:
@@ -422,14 +577,23 @@ def main():
             Tsm = float(np.mean(ims[max(0, ri - 200):ri + 1, 7]))          #the last 2 s
             pred = anchor[0] + a.clk_temp * (Tsm - anchor[1])
             ins.update(H, np.array([pred - ins.clk]), np.array([[a.clk_temp_sigma ** 2]]))
+        if a.adapt and r[0] >= next_ad and len(nis_hist) >= 20:
+            #NIS averages 1 when the filter's covariance is right; run consistently above it
+            #and the motion model is too sure of itself, so its noise rises in proportion
+            next_ad = r[0] + 1.0
+            ins.qscale = float(np.clip(np.mean(nis_hist) / a.adapt_target, 1.0, a.adapt_max))
+            qs_log.append(ins.qscale)
         if r[0] >= next_fix:
             next_fix += 1.0
             P = ins.P
             out.append((r[0], math.degrees(ins.lat), math.degrees(ins.lon), ins.h,
                         math.sqrt(P[0, 0] + P[1, 1]), ins.clk, ins.v[0], ins.v[1], ins.v[2],
-                        stats["fused"], float(np.linalg.norm(r[1:4]))))
-    print("bursts after wheels-off: fused %d, gated %d, ambiguous %d" % (
-        stats["fused"], stats["gated"], stats["amb"]))
+                        stats["fused"], float(np.linalg.norm(r[1:4])), math.sqrt(P[2, 2])))
+    print("bursts after wheels-off: fused %d, gated %d, ambiguous %d, widened %d times, zero-velocity %d" % (
+        stats["fused"], stats["gated"], stats["amb"], stats.get("widened", 0), stats.get("zupt", 0)))
+    if qs_log:
+        q_ = np.array(qs_log)
+        print("adaptive motion noise: median x%.1f, 95%% x%.1f, max x%.1f" % (np.median(q_), np.percentile(q_, 95), q_.max()))
     o = np.array(out)
     rr, vr, lat, lon, alt, sp = T.truth_at(gps, a.lag, o[:, 0])
     ok = np.isfinite(rr[:, 0])
@@ -444,12 +608,14 @@ def main():
                   "  (speed %3.0f m/s)" % (lo, hi, np.median(err[m]), np.percentile(err[m], 95),
                                            np.median(o[m, 4]), np.median(sp[m])))
     if a.out:
+        np.save(a.out.rsplit(".", 1)[0] + "_assoc.npy", np.array(assoc, float))
         with open(a.out, "w") as f:
-            f.write("t,min_after_loss,lat,lon,err,hacc,clk,vn,ve,vd,fused,gyro\n")
-            for row, e, mm, k_ in zip(o, err, mins, ok):
-                f.write("%.2f,%.3f,%.7f,%.7f,%s,%.1f,%.1f,%.2f,%.2f,%.2f,%d,%.4f\n" % (
+            f.write("t,min_after_loss,lat,lon,err,hacc,clk,vn,ve,vd,fused,gyro,h,h_err,vacc\n")
+            for j, (row, e, mm, k_) in enumerate(zip(o, err, mins, ok)):
+                f.write("%.2f,%.3f,%.7f,%.7f,%s,%.1f,%.1f,%.2f,%.2f,%.2f,%d,%.4f,%.1f,%s,%.1f\n" % (
                         row[0], mm, row[1], row[2], "%.1f" % e if k_ else "", row[4], row[5],
-                        row[6], row[7], row[8], row[9], row[10]))
+                        row[6], row[7], row[8], row[9], row[10], row[3],
+                        "%.1f" % (row[3] - alt[j] - 45.0) if k_ else "", row[11]))
     return 0
 
 

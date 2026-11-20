@@ -11,6 +11,7 @@ analysis tools (soop_truth.py) work from this instead. Arrays, all on board time
   sos   t, cpu, ovr, nt, clk, fused, amb, unm, nse      (the navigation's status, 1 Hz)
   sof   t, lat, lon, alt, hacc, nt, valid, still        (the board's own Iridium fix)
   imu   t, gx, gy, gz, ax, ay, az, temp                 (IMU 0, the mean of each IMU_DEC samples)
+  imu1  the same for IMU 1 (the ICM-42605)
   baro  t, alt, press, temp
   xkf   t, vn, ve, vd                                   (EKF velocity, core 0)
   soi   t, file, first_sample, board_t                  (I/Q file starts)
@@ -29,9 +30,9 @@ IMU_DEC = 2         #400 Hz -> 200 Hz, averaged: a point sample of every 4th ali
 def extract(path):
     from pymavlink import mavutil
     m = mavutil.mavlink_connection(path)
-    out = {k: [] for k in ("gps", "sob", "sos", "sof", "imu", "baro", "xkf", "soi", "sod", "sog")}
+    out = {k: [] for k in ("gps", "sob", "sos", "sof", "imu", "imu1", "baro", "xkf", "soi", "sod", "sog")}
     hacc = sacc = np.nan
-    n_imu, acc_imu = 0, []
+    acc_imu = {0: [], 1: []}
     want = ["GPS", "GPA", "SOB", "SOS", "SOF", "IMU", "BARO", "XKF1", "SOI", "SOD", "SOG"]
     while True:
         x = m.recv_match(type=want)
@@ -53,11 +54,12 @@ def extract(path):
         elif k == "SOF":
             out["sof"].append((t, x.Lat, x.Lng, x.Alt, x.HAcc, x.NT, x.V, x.St))
         elif k == "IMU":
-            if x.I == 0:
-                acc_imu.append((t, x.GyrX, x.GyrY, x.GyrZ, x.AccX, x.AccY, x.AccZ, x.T))
-                if len(acc_imu) == IMU_DEC:
-                    out["imu"].append(tuple(np.mean(acc_imu, axis=0)))
-                    acc_imu = []
+            if x.I in acc_imu:
+                q = acc_imu[x.I]
+                q.append((t, x.GyrX, x.GyrY, x.GyrZ, x.AccX, x.AccY, x.AccZ, x.T))
+                if len(q) == IMU_DEC:
+                    out["imu" if x.I == 0 else "imu1"].append(tuple(np.mean(q, axis=0)))
+                    q.clear()
         elif k == "BARO":
             if x.I == 0:
                 out["baro"].append((t, x.Alt, x.Press, x.Temp))
