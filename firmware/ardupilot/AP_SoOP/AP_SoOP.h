@@ -95,6 +95,9 @@ private:
     int16_t    *_block;
     int        _n_cat;
     bool       _replay, _swap_iq, _capturing;
+    //the spectrum's orientation, checked by Ring Alert decodes: they only succeed the right way up
+    uint16_t   _ori_strong, _ori_ira;
+    bool       _ori_locked;
     uint8_t    _bbg;
     float      _lo_off;          //Hz, the LO above Ring Alert
     double     _t0;              //board s of capture sample 0

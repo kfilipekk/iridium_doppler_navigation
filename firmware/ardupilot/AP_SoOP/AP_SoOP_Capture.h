@@ -25,6 +25,9 @@ public:
     uint32_t overruns() const { return _overruns; }
     uint32_t adc_errors() const;                          //ADC overruns the DMA missed
     double measured_hz() const;                           //complex samples/s since the first block
+    //which way up the spectrum is handed on: I and Q exchanged mirrors it about the LO
+    void set_swap(bool swap) { _swap = swap; }
+    bool swapped() const { return _swap; }
 
 private:
     uint64_t _start_us;
