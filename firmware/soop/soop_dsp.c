@@ -507,6 +507,10 @@ static void frame(soop_dsp_t *d, uint64_t m0)
         //noise: 30th percentile of an exponential is 0.357 x its mean
         memcpy(tmp, p, sizeof tmp);
         const float q = select_k(tmp, N, (int)(0.3f * N)) / 0.3567f;
+        if (!(q > 0.0f)) {
+            d->n_frames++;
+            return;
+        }
         d->noise = q;
         d->noise_init = 1;
         for (int k = 0; k < N; k++)
@@ -515,11 +519,15 @@ static void frame(soop_dsp_t *d, uint64_t m0)
         if (d->n_frames % NOISE_EVERY == 0) {
             memcpy(tmp, p, sizeof tmp);
             const float q = select_k(tmp, N, (int)(0.3f * N)) / 0.3567f;
-            //0.02 a frame, as NOISE_EVERY frames: 1 - 0.98^4
-            if (q < 4.0f * d->noise) d->noise += 0.0776f * (q - d->noise);
-            //the per-bin floors too, NOISE_EVERY times NBIN_ALPHA (they move over ~2000 frames)
-            for (int k = 0; k < N; k++)
-                d->nbin[k] += NOISE_EVERY * NBIN_ALPHA * (fminf(p[k], NBIN_CLIP * d->nbin[k]) - d->nbin[k]);
+            //0.02 a frame, as NOISE_EVERY frames: 1 - 0.98^4. A step up is clipped at 4x, not
+            //refused: a floor dragged down by a dropout's zeros must climb back. An empty frame
+            //(a gap filled with zeros) is no measure of the noise at all.
+            if (q > 0.0f) {
+                d->noise += 0.0776f * (fminf(q, 4.0f * d->noise) - d->noise);
+                //the per-bin floors too, NOISE_EVERY times NBIN_ALPHA (they move over ~2000 frames)
+                for (int k = 0; k < N; k++)
+                    d->nbin[k] += NOISE_EVERY * NBIN_ALPHA * (fminf(p[k], NBIN_CLIP * d->nbin[k]) - d->nbin[k]);
+            }
         }
     }
     d->n_frames++;
@@ -532,7 +540,9 @@ static void frame(soop_dsp_t *d, uint64_t m0)
             if (!(p[k] >= p[kl] && p[k] > p[kr]))
                 continue;
             float pk = p[kl] + p[k] + p[kr];
-            float nb = fmaxf(d->nbin[kl] + d->nbin[k] + d->nbin[kr], 3.0f * d->noise) / 3.0f;
+            //each bin against its own floor: the band-wide one sits above the quieter bins and
+            //cost 13% of the real bursts (flight 2026-11-18, against the u-blox: 97% real either way)
+            float nb = (d->nbin[kl] + d->nbin[k] + d->nbin[kr]) / 3.0f;
             const int aid = d->n_aid && aided(d, kk * FSD / N);
             if (pk < (aid ? TONE_SNR_AID : TONE_SNR_MIN) * 3.0f * nb)
                 continue;
@@ -540,8 +550,8 @@ static void frame(soop_dsp_t *d, uint64_t m0)
             float sh = 0;
             for (int s = 3; s <= 8; s++) {
                 int a = (kk + s + N) % N, b = (kk - s + N) % N;
-                sh = fmaxf(sh, p[a] - d->nbin[a] + d->noise);
-                sh = fmaxf(sh, p[b] - d->nbin[b] + d->noise);
+                sh = fmaxf(sh, p[a] - d->nbin[a]);
+                sh = fmaxf(sh, p[b] - d->nbin[b]);
             }
             if (p[k] < (aid ? TONE_NARROW_AID : TONE_NARROW) * fmaxf(sh, nb))
                 continue;

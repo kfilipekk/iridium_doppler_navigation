@@ -510,6 +510,9 @@ bool AP_SoOP::setup()
     soop_guard_default_cfg(&_gcfg);
     _lo_off = SOOP_LO_OFFSET_HZ;
     _nav->cfg.gps_lag_s = GPS_LAG_S;
+    //real bursts: the DSP's sigma is 5-10x optimistic (flights 2026-11-18/19); the library's
+    //1 Hz is for the simulator's ideal signals
+    _nav->cfg.sig_floor = 12.0;
     load_config();
     soop_dsp_set_lo(_dsp, _lo_off);
     cfg = _nav->cfg;
