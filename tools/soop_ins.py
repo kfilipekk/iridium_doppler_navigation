@@ -246,6 +246,8 @@ def main():
     ap.add_argument("--adapt-max", type=float, default=100.0)
     ap.add_argument("--no-doppler", action="store_true")
     ap.add_argument("--sig", type=float, default=20.0, help="Doppler noise floor, Hz")
+    ap.add_argument("--sig-scale", type=float, default=1.0,
+                    help="x the DSP's own sigma (it claims 3-10x too little on strong bursts)")
     ap.add_argument("--gate", type=float, default=5.0)
     ap.add_argument("--amb", type=float, default=4.0)
     ap.add_argument("--minutes", type=float, default=0.0, help="stop this long after the loss")
@@ -508,7 +510,7 @@ def main():
                 el = np.degrees(np.arcsin(u @ up))
                 dvv = SV[:, i] - vr
                 rdot = np.sum(dvv * u, 1)
-                R = np.array([[max(B[i, 2], 1.0) ** 2 + a.sig ** 2]])
+                R = np.array([[(a.sig_scale * max(B[i, 2], 1.0)) ** 2 + a.sig ** 2]])
                 d2 = SR2[:, i] - rr
                 u2 = d2 / np.linalg.norm(d2, axis=1)[:, None]
                 rate_i = -T.F_RA / T.C * (np.sum((SV2[:, i] - vr) * u2, 1) - rdot) / 0.5

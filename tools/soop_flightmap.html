@@ -1,0 +1,188 @@
+<title>NAVCORE Flight Replay</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<style>
+:root{color-scheme:dark;--bg:#1e1e1e;--side:#252526;--sea:#1a1d21;--line:#3c3c3c;--fg:#cccccc;--dim:#858585;--faint:#5a5a5a;
+--blue:#007acc;--coast:#6b7a89;--border:#4a4f55;--gps:#4ec9b0;--irid:#c586c0;--imu:#cca700;--ok:#89d185;--bad:#f48771}
+*{box-sizing:border-box}html,body{height:100%;margin:0}[hidden]{display:none!important}
+body{background:var(--bg);color:var(--fg);font:13px/1.4 "Segoe UI",system-ui,-apple-system,sans-serif;display:grid;grid-template-rows:auto 1fr;overflow:hidden}
+.mono{font-family:Consolas,"Cascadia Code",Menlo,"DejaVu Sans Mono",monospace;font-variant-numeric:tabular-nums}
+header{background:#323233;display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;padding:5px 16px;font-size:12px;color:var(--dim);border-bottom:1px solid #2b2b2b}
+header b{color:var(--fg);font-weight:600}
+.tabs{display:flex;gap:2px}
+.tabs button{background:transparent;color:var(--dim);border:0;border-bottom:2px solid transparent;font:inherit;padding:4px 10px;cursor:pointer}
+.tabs button[aria-selected=true]{color:var(--fg);border-bottom-color:var(--blue)}
+main{display:grid;grid-template-columns:1fr 290px;grid-template-rows:minmax(0,1fr) auto 170px;min-height:0}
+#mapwrap{position:relative;min-height:0;background:var(--sea);border-right:1px solid var(--line)}
+canvas{width:100%;height:100%;display:block}
+.mapbtns{position:absolute;top:10px;right:10px;display:flex;gap:4px}
+.btn{background:#2d2d2d;color:var(--fg);border:1px solid var(--line);border-radius:3px;font:12px inherit;padding:3px 9px;cursor:pointer}
+.btn[aria-pressed=true]{border-color:var(--blue);color:#fff}
+aside{grid-row:1/4;grid-column:2;background:var(--side);overflow:auto;padding-bottom:12px}
+.sec{padding:12px 14px 4px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);font-weight:600}
+.big{font-size:30px;padding:0 14px;line-height:1.1}.big small{font-size:12px;color:var(--dim)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;padding:2px 14px 6px}
+.kv span:nth-child(odd){color:var(--dim)}.kv span:nth-child(even){text-align:right}
+.pill{display:inline-block;padding:0 7px;border-radius:9px;font-size:11px;font-weight:600}
+.pill.in{background:#16825d;color:#fff}.pill.out{background:#a1260d;color:#fff}
+.legend{display:grid;gap:5px;padding:4px 14px}
+.legend span{display:flex;align-items:center;gap:8px}.legend i{width:18px;height:0;border-top:2px solid;display:inline-block}
+table{border-collapse:collapse;width:calc(100% - 28px);margin:2px 14px;font-size:12px}
+th,td{padding:3px 4px;text-align:right;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:400}td:first-child,th:first-child{text-align:left}
+.note{padding:6px 14px;color:var(--dim);font-size:12px}
+.bar{grid-column:1;display:flex;align-items:center;gap:10px;padding:6px 12px;background:var(--side);border-top:1px solid var(--line);border-right:1px solid var(--line)}
+.bar input[type=range]{flex:1;accent-color:var(--blue);min-width:0}
+.bar select{background:#2d2d2d;color:var(--fg);border:1px solid var(--line);font:12px inherit}
+#chartwrap{grid-column:1;position:relative;border-right:1px solid var(--line);border-top:1px solid var(--line)}
+#tip{position:absolute;pointer-events:none;background:#252526;border:1px solid var(--line);padding:4px 8px;font-size:12px;white-space:nowrap}
+@media (max-width:820px){
+  body{overflow:auto;height:auto}
+  main{grid-template-columns:1fr;grid-template-rows:62vh auto 170px auto}
+  aside{grid-row:auto;grid-column:1}
+  #mapwrap,.bar,#chartwrap{border-right:0}
+}
+</style>
+<header><b>NAVCORE</b><span>flight replay · board position without GPS after wheels-off</span><div class="tabs" id="tabs" role="tablist"></div></header>
+<main>
+  <div id="mapwrap"><canvas id="map" aria-label="Map of the true and estimated flight paths"></canvas>
+    <div class="mapbtns"><button class="btn" id="fit">fit</button><button class="btn" id="follow" aria-pressed="false">follow</button></div></div>
+  <aside>
+    <div class="sec">error now</div>
+    <div class="big mono" id="err">-</div>
+    <div class="kv mono" id="kv"></div>
+    <div class="sec">key</div>
+    <div class="legend">
+      <span><i style="border-color:var(--gps)"></i>u-blox GPS (truth)</span>
+      <span><i style="border-color:var(--irid)"></i>board: IMU + Iridium + cabin baro</span>
+      <span><i style="border-color:var(--irid);border-top-style:dotted"></i>its stated 2&sigma; circle</span>
+      <span><i style="border-color:var(--imu);border-top-style:dashed"></i>IMU alone (no Iridium)</span>
+    </div>
+    <div class="sec">median error by phase</div>
+    <table class="mono" id="phases"></table>
+    <div class="note" id="note"></div>
+  </aside>
+  <div class="bar"><button class="btn" id="play">&#9654; play</button>
+    <select id="speed" aria-label="replay speed"><option value="30">30&times;</option><option value="60" selected>60&times;</option><option value="180">180&times;</option></select>
+    <input type="range" id="slider" min="0" max="1" step="1" value="0" aria-label="time since wheels-off"><span class="mono" id="clock">00:00</span></div>
+  <div id="chartwrap"><canvas id="chart" aria-label="Error against time"></canvas><div id="tip" hidden></div></div>
+</main>
+<script>
+const DATA=/*DATA*/null;
+const $=id=>document.getElementById(id);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C={gps:css('--gps'),irid:css('--irid'),imu:css('--imu'),coast:css('--coast'),border:css('--border'),fg:css('--fg'),dim:css('--dim'),faint:css('--faint'),line:css('--line')};
+let fi=0,F=null,t=0,playing=false,follow=false,view=null,last=0;
+const mmss=s=>{s=Math.max(0,Math.round(s));return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')};
+const km=m=>m>=10000?(m/1000).toFixed(0)+' km':m>=1000?(m/1000).toFixed(1)+' km':Math.round(m)+' m';
+function at(arr,tt){ //nearest row at or before tt
+  let lo=0,hi=arr.length-1;if(!arr.length||tt<arr[0][0])return null;
+  while(lo<hi){const mid=(lo+hi+1)>>1;if(arr[mid][0]<=tt)lo=mid;else hi=mid-1}return arr[lo]}
+function phase(m){return m<5?'take-off and climb':m<15?'climb':m<45?'cruise':'descent and landing'}
+function setup(cv){const r=cv.getBoundingClientRect(),d=devicePixelRatio||1;cv.width=Math.max(1,r.width*d);cv.height=Math.max(1,r.height*d);
+  const g=cv.getContext('2d');g.setTransform(d,0,0,d,0,0);return [g,r.width,r.height]}
+//map projection: km east/north of the view centre, then pixels
+function proj(lat,lon){const c=view;return [c.W/2+(lon-c.lon)*111.32*Math.cos(c.lat*Math.PI/180)*c.s, c.H/2-(lat-c.lat)*110.57*c.s]}
+function fit(){
+  const cv=$('map'),r=cv.getBoundingClientRect(),pts=F.truth.concat(F.est);
+  const la=pts.map(p=>p[1]),lo=pts.map(p=>p[2]),la0=Math.min(...la),la1=Math.max(...la),lo0=Math.min(...lo),lo1=Math.max(...lo);
+  const lat=(la0+la1)/2,lon=(lo0+lo1)/2,wk=(lo1-lo0)*111.32*Math.cos(lat*Math.PI/180),hk=(la1-la0)*110.57;
+  view={lat,lon,W:r.width,H:r.height,s:Math.min(r.width/(wk*1.15+1),r.height/(hk*1.25+1))};}
+function line(g,pts,col,w,dash){if(pts.length<2)return;g.beginPath();g.strokeStyle=col;g.lineWidth=w;g.setLineDash(dash||[]);
+  pts.forEach((p,i)=>{const [x,y]=proj(p[1],p[2]);i?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();g.setLineDash([])}
+function drawMap(){
+  const [g,W,H]=setup($('map'));view.W=W;view.H=H;
+  const e=at(F.est,t),tr=at(F.truth,t);
+  if(follow&&e){view.lat=e[1];view.lon=e[2]}
+  g.lineJoin='round';g.lineCap='round';
+  DATA.border.forEach(l=>line(g,l.map(p=>[0,p[1],p[0]]),C.border,1,[4,4]));
+  DATA.coast.forEach(l=>line(g,l.map(p=>[0,p[1],p[0]]),C.coast,1.2));
+  g.font='11px system-ui,sans-serif';
+  DATA.places.forEach(([n,la,lo,k])=>{const [x,y]=proj(la,lo);if(x<-40||y<-20||x>W+40||y>H+20)return;
+    g.fillStyle=k=='apt'?C.fg:C.dim;if(k=='apt')g.fillRect(x-3,y-3,6,6);else{g.beginPath();g.arc(x,y,2,0,7);g.fill()}
+    g.fillText(n,x+6,y+4)});
+  //the truth: all of it faint, flown part solid
+  line(g,F.truth,C.gps+'55',2);line(g,F.truth.filter(p=>p[0]<=t),C.gps,2.2);
+  line(g,F.imu.filter(p=>p[0]<=t),C.imu,1.6,[6,5]);
+  line(g,F.est.filter(p=>p[0]<=t),C.irid,2.2);
+  const im=at(F.imu,t);
+  if(im&&t<=F.imu[F.imu.length-1][0]){const [x,y]=proj(im[1],im[2]);g.fillStyle=C.imu;g.beginPath();g.arc(x,y,4,0,7);g.fill()}
+  if(e&&tr){
+    const [xe,ye]=proj(e[1],e[2]),[xt,yt]=proj(tr[1],tr[2]);
+    g.beginPath();g.strokeStyle=C.fg+'99';g.setLineDash([3,3]);g.moveTo(xt,yt);g.lineTo(xe,ye);g.stroke();g.setLineDash([]);
+    const r2=2*e[3]/1000*view.s;g.beginPath();g.strokeStyle=C.irid;g.lineWidth=1.2;g.setLineDash([2,3]);g.arc(xe,ye,Math.max(r2,3),0,7);g.stroke();g.setLineDash([]);
+    [[xt,yt,C.gps],[xe,ye,C.irid]].forEach(([x,y,c])=>{g.fillStyle=c;g.strokeStyle='#1e1e1e';g.lineWidth=2;g.beginPath();g.arc(x,y,5.5,0,7);g.fill();g.stroke()});
+  }
+  //scale bar
+  const want=120/view.s,steps=[1,2,5,10,20,50,100,200,500],sk=steps.find(s=>s>=want*0.6)||500,px=sk*view.s;
+  g.strokeStyle=C.fg;g.lineWidth=1.5;g.beginPath();g.moveTo(14,H-16);g.lineTo(14+px,H-16);g.moveTo(14,H-20);g.lineTo(14,H-12);g.moveTo(14+px,H-20);g.lineTo(14+px,H-12);g.stroke();
+  g.fillStyle=C.fg;g.fillText(sk+' km',18+px,H-12);
+}
+const CH={L:52,R:14,T:10,B:24,lo:Math.log10(50),hi:Math.log10(1e6)};
+function drawChart(){
+  const [g,W,H]=setup($('chart')),{L,R,T,B}=CH,t1=Math.max(F.est[F.est.length-1][0],1);
+  const x=s=>L+s/t1*(W-L-R),y=m=>T+(1-(Math.log10(Math.max(m,60))-CH.lo)/(CH.hi-CH.lo))*(H-T-B);
+  g.font='11px system-ui,sans-serif';
+  [[0,5],[15,45]].forEach(([a,b])=>{g.fillStyle='#ffffff08';g.fillRect(x(a*60),T,x(b*60)-x(a*60),H-T-B)});
+  [[0,'climb'],[15,'cruise'],[45,'descent']].forEach(([m,n])=>{g.fillStyle=C.faint;g.fillText(n,x(m*60)+4,T+11)});
+  [100,1e3,1e4,1e5,1e6].forEach(v=>{g.strokeStyle=C.line;g.lineWidth=1;g.beginPath();g.moveTo(L,y(v));g.lineTo(W-R,y(v));g.stroke();
+    g.fillStyle=C.dim;g.textAlign='right';g.fillText(km(v),L-6,y(v)+4);g.textAlign='left'});
+  for(let m=0;m*60<=t1;m+=15){g.fillStyle=C.dim;g.textAlign='center';g.fillText(m+' min',x(m*60),H-7);g.textAlign='left'}
+  const pl=(arr,col,w,dash,fn)=>{g.beginPath();g.strokeStyle=col;g.lineWidth=w;g.setLineDash(dash||[]);arr.forEach((p,i)=>{const X=x(p[0]),Y=y(fn(p));i?g.lineTo(X,Y):g.moveTo(X,Y)});g.stroke();g.setLineDash([])};
+  g.save();g.beginPath();g.rect(L,T,W-L-R,H-T-B);g.clip();
+  pl(F.est,C.irid+'66',1,[2,3],p=>2*p[3]);
+  if(F.imu.length)pl(F.imu,C.imu,1.6,[6,5],p=>p[3]);
+  pl(F.est,C.irid,2,null,p=>p[4]);
+  g.restore();
+  g.strokeStyle=C.fg;g.lineWidth=1;g.beginPath();g.moveTo(x(t),T);g.lineTo(x(t),H-B);g.stroke();
+  CH.x=x;CH.W=W;CH.t1=t1;
+}
+function panel(){
+  const e=at(F.est,t),tr=at(F.truth,t),im=at(F.imu,t);
+  $('clock').textContent=mmss(t);$('slider').value=Math.round(t);
+  if(!e){$('err').innerHTML='-';return}
+  $('err').innerHTML=km(e[4])+' <small>off</small>';
+  const inside=e[4]<=2*e[3];
+  const kv=[['since wheels-off',mmss(t)],['phase',phase(t/60)],['stated 2σ',km(2*e[3])],['inside 2σ',`<span class="pill ${inside?'in':'out'}">${inside?'yes':'no'}</span>`],
+    ['IMU alone',im&&t<=F.imu[F.imu.length-1][0]?km(im[3]):'-'],['altitude',tr?Math.round(tr[3])+' m':'-'],['ground speed',tr?Math.round(tr[4]*3.6)+' km/h':'-'],['bursts fused',e[5]]];
+  $('kv').innerHTML=kv.map(([k,v])=>`<span>${k}</span><span>${v}</span>`).join('');
+}
+function phases(){
+  const med=a=>{if(!a.length)return null;a=a.slice().sort((p,q)=>p-q);return a[a.length>>1]};
+  const rowsP=[['0-15 min',0,15],['cruise 15-45',15,45],['descent 45-75',45,75]];
+  $('phases').innerHTML='<tr><th></th><th>Iridium</th><th>IMU alone</th></tr>'+rowsP.map(([n,a,b])=>{
+    const i=med(F.est.filter(p=>p[0]>=a*60&&p[0]<b*60).map(p=>p[4])),m=med(F.imu.filter(p=>p[0]>=a*60&&p[0]<b*60).map(p=>p[3]));
+    return `<tr><td>${n}</td><td>${i==null?'-':km(i)}</td><td>${m==null?'-':km(m)}</td></tr>`}).join('');
+}
+function draw(){drawMap();drawChart();panel()}
+function pick(i){fi=i;F=DATA.flights[i];t=0;$('slider').max=Math.round(F.est[F.est.length-1][0]);
+  [...$('tabs').children].forEach((b,k)=>b.setAttribute('aria-selected',k==i));fit();phases();draw()}
+DATA.flights.forEach((f,i)=>{const b=document.createElement('button');b.role='tab';b.textContent=f.label;b.onclick=()=>pick(i);$('tabs').append(b)});
+$('note').textContent=DATA.note||'';
+$('slider').oninput=e=>{t=+e.target.value;draw()};
+$('play').onclick=()=>{playing=!playing;$('play').innerHTML=playing?'&#10074;&#10074; pause':'&#9654; play';if(playing){if(t>=+$('slider').max)t=0;last=performance.now();requestAnimationFrame(tick)}};
+function tick(now){if(!playing)return;t=Math.min(+$('slider').max,t+(now-last)/1000*+$('speed').value);last=now;draw();
+  if(t>=+$('slider').max){playing=false;$('play').innerHTML='&#9654; play';return}requestAnimationFrame(tick)}
+$('fit').onclick=()=>{follow=false;$('follow').setAttribute('aria-pressed','false');fit();draw()};
+$('follow').onclick=()=>{follow=!follow;$('follow').setAttribute('aria-pressed',follow);if(follow&&view.s<0.5)view.s=1.2;draw()};
+//pan and zoom
+const mc=$('map');let drag=null;
+mc.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY,view.lat,view.lon];mc.setPointerCapture(e.pointerId)});
+mc.addEventListener('pointermove',e=>{if(!drag)return;const dx=e.clientX-drag[0],dy=e.clientY-drag[1];
+  view.lon=drag[3]-dx/view.s/(111.32*Math.cos(view.lat*Math.PI/180));view.lat=drag[2]+dy/view.s/110.57;follow=false;$('follow').setAttribute('aria-pressed','false');drawMap()});
+mc.addEventListener('pointerup',()=>drag=null);
+mc.addEventListener('wheel',e=>{e.preventDefault();const r=mc.getBoundingClientRect(),mx=e.clientX-r.left-view.W/2,my=e.clientY-r.top-view.H/2,f=Math.exp(-e.deltaY*0.0015);
+  const kx=111.32*Math.cos(view.lat*Math.PI/180);view.lon+=mx/view.s/kx*(1-1/f);view.lat-=my/view.s/110.57*(1-1/f);view.s*=f;drawMap()},{passive:false});
+//the chart sets the time; hover reads it
+const cc=$('chart');
+function chartT(e){const r=cc.getBoundingClientRect();return Math.max(0,Math.min(CH.t1,(e.clientX-r.left-CH.L)/(CH.W-CH.L-CH.R)*CH.t1))}
+cc.addEventListener('pointerdown',e=>{t=chartT(e);draw()});
+cc.addEventListener('pointermove',e=>{const tt=chartT(e),p=at(F.est,tt),m=at(F.imu,tt),tip=$('tip');if(!p){tip.hidden=true;return}
+  tip.hidden=false;tip.innerHTML=`<span class="mono">${mmss(tt)}</span> &nbsp;board <b>${km(p[4])}</b> (2σ ${km(2*p[3])})`+(m&&tt<=F.imu[F.imu.length-1][0]?` &nbsp;IMU alone <b>${km(m[3])}</b>`:'');
+  const r=cc.getBoundingClientRect();tip.style.left=Math.min(e.clientX-r.left+12,r.width-tip.offsetWidth-4)+'px';tip.style.top='6px';
+  if(e.buttons){t=tt;draw()}});
+cc.addEventListener('pointerleave',()=>$('tip').hidden=true);
+addEventListener('resize',()=>{if(F){const s=view;fit();if(follow)view.s=s.s;draw()}});
+//#f2m30: flight 2, minute 30 (a bare token, so a link can open a moment)
+const hm=/^#(?:f(\d))?(?:m(\d+))?$/.exec(location.hash||'');
+pick(hm&&hm[1]?Math.min(+hm[1]-1,DATA.flights.length-1):0);
+if(hm&&hm[2]){t=Math.min(+hm[2]*60,+$('slider').max);draw()}
+</script>

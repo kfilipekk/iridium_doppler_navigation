@@ -750,7 +750,9 @@ int soop_nav_predict(soop_nav_t *nav, double t_board, float *f_hz, float *sd_hz,
     return n;
 }
 
-static void fuse(soop_nav_t *nav, double tb, double f_hz, double sigma, int sat, int ch)
+//1 when the burst went into the state; 0 when its satellite has no geometry, or it fails the gate
+//against the state it is fused to (a new slot's prior, not the one it was matched with)
+static int fuse(soop_nav_t *nav, double tb, double f_hz, double sigma, int sat, int ch)
 {
     const double tu = utc_of(nav, tb);
     int slot = slot_of(nav, sat);
@@ -762,12 +764,12 @@ static void fuse(soop_nav_t *nav, double tb, double f_hz, double sigma, int sat,
     satgeo_t g;
     const double tau = nav->x[IDT] + nav->x[SOOP_NAV_NBASE + SOOP_NAV_NS * slot + 1];
     if (sat_geometry(nav, sat, tu, tau, &g) != 0)
-        return;
+        return 0;
     pred_t p;
     predict(nav, &g, slot, 0, sat, tb, tu, f_hz, sigma, ch, R, v_ned, &p);
     const double q = p.y * p.y / p.S;
     if (q > nav->cfg.gate * nav->cfg.gate)
-        return;
+        return 0;
     kalman(nav, &p.h, p.y, p.r2);
     nav->last_sat = (int)nav->cat[sat].norad;
     nav->last_cat = sat;
@@ -777,6 +779,7 @@ static void fuse(soop_nav_t *nav, double tb, double f_hz, double sigma, int sat,
     nav->heard[slot] = tb;
     nav->last_fused = tb;
     nav->nis_avg += 0.02 * (q - nav->nis_avg);
+    return 1;
 }
 
 //a new satellite's (or a doubted track's) bursts
@@ -986,11 +989,9 @@ int soop_nav_burst(soop_nav_t *nav, double t_board, double f_hz, double sigma_hz
     }
     if (nc >= 1 && (nc == 1 || cd[1].q > c->amb_ratio * fmax(cd[0].q, 1.0))) {
         if (slot_of(nav, cd[0].sat) >= 0) {
-            fuse(nav, t_board, f_hz, sigma_hz, cd[0].sat, cd[0].ch);
-            res = SOOP_B_FUSED;
+            res = fuse(nav, t_board, f_hz, sigma_hz, cd[0].sat, cd[0].ch) ? SOOP_B_FUSED : SOOP_B_REJECTED;
         } else if (pend_push(nav, nav->pend, cd[0].sat, t_board, cd[0].y)) {
-            fuse(nav, t_board, f_hz, sigma_hz, cd[0].sat, cd[0].ch);
-            res = SOOP_B_FUSED;
+            res = fuse(nav, t_board, f_hz, sigma_hz, cd[0].sat, cd[0].ch) ? SOOP_B_FUSED : SOOP_B_REJECTED;
         } else {
             res = SOOP_B_PENDING;
         }
