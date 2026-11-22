@@ -324,7 +324,7 @@ function timeline(d){
 }
 function map(d){
   const [g,W,H]=setup($('map'));const tr=d.track.slice(-1800),u=d.ublox;
-  const ext=nice(Math.max(20,...tr.map(p=>Math.max(Math.abs(p[1]),Math.abs(p[2]))))*1.1);
+  const ext=nice(Math.max(20,...tr.map(p=>Math.max(Math.abs(p[1]),Math.abs(p[2]))),...u.map(p=>Math.max(Math.abs(p[1]),Math.abs(p[2]))))*1.1);
   const cx=W/2,cy=H/2,sc=(Math.min(W,H)/2-18)/ext,X=e=>cx+e*sc,Y=n=>cy-n*sc;
   g.strokeStyle=css('--line');g.fillStyle=css('--dim');
   [ext/2,ext].forEach(r=>{g.beginPath();g.arc(cx,cy,r*sc,0,7);g.stroke();g.fillText(r+' m',cx+r*sc*0.71+3,cy-r*sc*0.71)});
@@ -399,10 +399,13 @@ function passes(d){
 async function tick(){
   let d;try{d=await (await fetch('/api',{cache:'no-store'})).json()}catch(e){$('sbstate').textContent='server not reachable';return}
   if(!d.ok){$('sbstate').textContent=d.why;return}
-  const p=d.track[d.track.length-1],e=Math.hypot(p[1],p[2]);
-  $('file').textContent=d.file;$('err').innerHTML=fm(e).replace(' m','<small> m</small>');
-  $('ifix').textContent=['none','no fix','2D','3D'][p[5]]||p[5];$('isats').textContent=p[4];$('ihacc').textContent=fm(p[3]);
-  $('ine').textContent=p[1].toFixed(0)+' / '+p[2].toFixed(0)+' m';
+  $('file').textContent=d.file;
+  const p=d.track.length?d.track[d.track.length-1]:null;
+  if(p){const e=Math.hypot(p[1],p[2]);
+    $('err').innerHTML=fm(e).replace(' m','<small> m</small>');
+    $('ifix').textContent=['none','no fix','2D','3D'][p[5]]||p[5];$('isats').textContent=p[4];$('ihacc').textContent=fm(p[3]);
+    $('ine').textContent=p[1].toFixed(0)+' / '+p[2].toFixed(0)+' m';}
+  else{$('err').innerHTML='<small>waiting for the first Iridium fix</small>';['ifix','isats','ihacc','ine'].forEach(k=>$(k).textContent='—')}
   const u=d.ublox_now;$('gstate').innerHTML=d.denied?'<span class="pill den">DENIED</span>':'<span class="pill on">IN USE</span>';
   $('gsats').textContent=u?u.sats:'—';$('ghacc').textContent=u?fm(u.hacc):'—';
   $('rlat').textContent=d.ref[0].toFixed(7);$('rlon').textContent=d.ref[1].toFixed(7);$('rhow').textContent=d.ref_how;

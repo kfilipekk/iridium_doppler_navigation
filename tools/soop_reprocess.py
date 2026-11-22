@@ -14,7 +14,7 @@ says how many really went in each second; the unlogged ones are put beside that 
 ones (drops come in runs, while the card stalls), or at its start. --swap exchanges I
 and Q first: Rev E's spectrum comes out mirrored about the LO (2026-11-20, every session so far),
 which hides Ring Alert from the DSP. Block-numbered files (.iq4b/.i16b, firmware since
-f93b386) carry their own timeline and are already the right way up unless SOW says otherwise:
+8c0988e) carry their own timeline and are already the right way up unless SOW says otherwise:
 leave --swap off for them. The csv adds t (board s) and the file number to dsp_host's.
 """
 import argparse
@@ -145,7 +145,10 @@ def one_file(args):
 
 
 def run_dsp(out_path, t_s0, fno):
-    res = subprocess.run([DSP_HOST, out_path], capture_output=True, text=True)
+    #SOOP_DSP_LO (Hz) centres the DSP elsewhere than the Ring Alert, e.g. -83333 for the two
+    #simplex channels 125-167 kHz above it; the workers are separate processes, so not an option
+    lo = os.environ.get("SOOP_DSP_LO")
+    res = subprocess.run([DSP_HOST, out_path] + (["--lo", lo] if lo else []), capture_output=True, text=True)
     os.remove(out_path)
     rows = list(csv.DictReader(res.stdout.splitlines()))
     for row in rows:

@@ -129,9 +129,8 @@ define HAL_GPIO_B_LED_PIN 90
 
 # order of UARTs (and USB)
 # [was: SERIAL_ORDER OTG1 UART7 USART1 USART2 USART3 UART8 UART4 USART6 OTG2]
-# UART4 gave PB8 to PWM7. EMPTY keeps every other SERIALn where MatekH743 has
-# it.
-SERIAL_ORDER OTG1 UART7 USART1 USART2 USART3 UART8 EMPTY USART6 OTG2
+# Remove UART4 to free PB8 for PWM7 and drop nonexistent OTG2.
+SERIAL_ORDER OTG1 UART7 USART1 USART2 USART3 UART8 EMPTY USART6
 
 # USART1 (telem2)
 PA10 USART1_RX USART1
@@ -296,6 +295,11 @@ SPIDEV tle_flash  SPI3 DEVID2 EXT_CS2 MODE3 8*MHZ 32*MHZ
 # No on-board compass by design: a magnetometer 15 mm from a 60 A 4-in-1 ESC is
 # useless. I2C1 is on the GPS connector - use the compass inside the GPS module.
 define ALLOW_ARM_NO_COMPASS 1
+
+# USB VBUS sensing is not wired to PA9 on this board (PA9 is USART1_TX on J11;
+# VBUS feeds +5V_LOGIC through diode D_USB). Without this define, ChibiOS sets
+# GCCFG_VBDEN and halts USB enumeration waiting for VBUS on PA9.
+define BOARD_OTG_NOVBUSSENS 1
 
 # U19, the TMP119 beside U9, needs this line or it is dead SILICON.
 define AP_TEMPERATURE_SENSOR_ENABLED 1
