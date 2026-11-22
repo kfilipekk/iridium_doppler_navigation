@@ -251,6 +251,10 @@ def main():
     ap.add_argument("--gate", type=float, default=5.0)
     ap.add_argument("--amb", type=float, default=4.0)
     ap.add_argument("--minutes", type=float, default=0.0, help="stop this long after the loss")
+    ap.add_argument("--max-gap", type=float, default=10.0,
+                    help="s: IMU log gaps up to this are bridged with the last reading (was: skipped over 0.5)")
+    ap.add_argument("--gps-until", type=float, default=0.0,
+                    help="minutes after wheels-off that the u-blox keeps aiding (0: lost at wheels-off)")
     ap.add_argument("--out")
     ap.add_argument("--vrw", type=float, default=0.02)       #m/s/sqrt(s)
     ap.add_argument("--arw", type=float, default=3e-4)       #rad/sqrt(s)
@@ -260,6 +264,10 @@ def main():
     ap.add_argument("--gyro-sf", type=float, default=0.02, help="attitude error per radian turned")
     ap.add_argument("--gyro-temp", action="store_true", help="feed the gyro bias forward with temperature")
     ap.add_argument("--widen", type=float, default=2.0, help="covariance factor when most bursts fail the gate (1 = off)")
+    ap.add_argument("--rate-cap", type=float, default=0.0,
+                    help="bursts per satellite per 10 s that count fully; past it each is down-weighted (0 = off)")
+    ap.add_argument("--sat-widen", type=int, default=0,
+                    help="widen too when one unused satellite nearly fits this many bursts in 60 s (0 = off)")
     ap.add_argument("--chans", default="-1,0,1", help="channels matched, offsets from Ring Alert")
     ap.add_argument("--both-imus", action="store_true", help="average IMU 0 and IMU 1")
     ap.add_argument("--cap-pos", type=float, default=1e12, help="widening stops at this sigma, m (off: a 5 km cap kept the outbound descent from recovering)")
@@ -396,7 +404,9 @@ def main():
     rows = list(csv.DictReader(open(a.bursts)))
     B = np.array([[float(r["t"]), float(r["f_hz"]), float(r["f_sigma_hz"])] for r in rows])
     B = B[np.argsort(B[:, 0])]
-    t_end = imu[-1, 0] if a.minutes <= 0 else t_off + 60 * a.minutes
+    #GPS goes at wheels-off, or --gps-until minutes later (lost in flight, the IMU calibrated in the air)
+    t_loss = t_off + 60.0 * a.gps_until
+    t_end = imu[-1, 0] if a.minutes <= 0 else t_loss + 60 * a.minutes
     B = B[(B[:, 0] > t0) & (B[:, 0] < t_end)]
     sats, norad = T.load_tles(a.tle)
     SR, SV = T.sat_ecef(sats, to_utc(B[:, 0]))
@@ -409,13 +419,13 @@ def main():
     for i in range(i0, len(G)):
         if te[i] >= t_end:
             break
-        if i % 5 == 0 and te[i] <= t_off:
+        if i % 5 == 0 and te[i] <= t_loss:
             ev.append((te[i], 0, i))
         elif i % 5 == 0 and a.alt_sigma > 0:
             ev.append((te[i], 1, i))
         elif i % 5 == 0 and cab_map is not None:
             ev.append((te[i], 3, i))
-        if i % 5 == 0 and te[i] > t_off and a.vd_bound > 0:
+        if i % 5 == 0 and te[i] > t_loss and a.vd_bound > 0:
             ev.append((te[i] + 1e-3, 4, i))
     for j in range(len(B)):
         ev.append((B[j, 0], 2, j))
@@ -424,18 +434,26 @@ def main():
     out, ei, n_f, n_amb, n_none, last_t = [], 0, 0, 0, 0, t0
     next_fix = t_off
     stats = dict(fused=0, gated=0, amb=0)
-    anchor, next_tc = None, t_off
+    anchor, next_tc = None, t_loss
     wbuf, fbuf, last_z = collections.deque(maxlen=400), collections.deque(maxlen=400), -1e9
     cab_high = [False]
     nis_hist, next_ad, qs_log = collections.deque(maxlen=a.adapt_n), t_off, []
     recent, last_widen = collections.deque(maxlen=60), -1e9
+    near_miss, fused_at, sat_recent = {}, {}, {}
     assoc = []
     for ri, r in enumerate(ims):
         dt = r[0] - last_t
         last_t = r[0]
-        if dt <= 0 or dt > 0.5:
+        if dt <= 0 or dt > a.max_gap:
             continue
-        ins.mech(r[1:4] - bg_ff(r[7]), r[4:7], dt)
+        #the log drops IMU records when the card is busy (up to 1.5 s in flight): carry this
+        #reading across the gap in small steps, so position, velocity and P keep moving. Skipping
+        #it froze the aircraft for the gap - 270 m at cruise - while P stayed small
+        n_sub = max(1, int(math.ceil(dt / 0.01)))
+        for _ in range(n_sub):
+            ins.mech(r[1:4] - bg_ff(r[7]), r[4:7], dt / n_sub)
+        if dt > 0.05:
+            stats["gaps"] = stats.get("gaps", 0) + 1
         #the IMU still (the board's own detector, AP_SoOP.cpp: gyro and |f| steady): the vehicle
         #is parked - after landing, at the gate - and its velocity is zero
         if a.zupt and r[0] > t_off:
@@ -541,6 +559,27 @@ def main():
                 if cands[0][0] > a.gate ** 2:
                     stats["gated"] += 1
                     recent.append(0)
+                    #a satellite that keeps nearly fitting while it is not being used: the filter
+                    #has walked off and follows the one satellite it still accepts (EZY8636, GPS
+                    #lost 10 min up: only 41925 fused while three risen satellites were gated)
+                    s_near = cands[0][3]
+                    if a.sat_widen > 0 and cands[0][0] < (4 * a.gate) ** 2 \
+                            and B[i, 0] - fused_at.get(s_near, -1e9) > 60:
+                        q = near_miss.setdefault(s_near, collections.deque())
+                        q.append(B[i, 0])
+                        while q and B[i, 0] - q[0] > 60:
+                            q.popleft()
+                        if len(q) >= a.sat_widen and B[i, 0] - last_widen > 10:
+                            for blk, cap in ((slice(IP, IP + 3), a.cap_pos), (slice(IV, IV + 3), a.cap_vel),
+                                             (slice(IA, IA + 3), a.cap_att)):
+                                sd = math.sqrt(max(np.diag(ins.P)[blk].max(), 1e-12))
+                                f = min(a.widen, cap / sd) if sd < cap else 1.0
+                                if f > 1.0:
+                                    g_ = math.sqrt(f)
+                                    ins.P[blk, :] *= g_; ins.P[:, blk] *= g_
+                            last_widen = B[i, 0]
+                            q.clear()
+                            stats["sat_widened"] = stats.get("sat_widened", 0) + 1
                     #most bursts failing the gate means the filter is wrong about itself, not the
                     #sky: widen it so the bursts that would correct it get through again
                     if len(recent) >= 30 and sum(list(recent)[-30:]) < 9 and B[i, 0] - last_widen > 10:
@@ -561,17 +600,26 @@ def main():
                     stats["amb"] += 1
                     continue
                 _, H, yv, s_, k, Rc, ch_ = cands[0]
+                if a.rate_cap > 0:
+                    #a satellite's errors (orbit, transmit offset) last its whole pass, not one
+                    #burst: past rate_cap bursts in 10 s, each counts for proportionally less
+                    q = sat_recent.setdefault(s_, collections.deque())
+                    while q and B[i, 0] - q[0] > 10.0:
+                        q.popleft()
+                    q.append(B[i, 0])
+                    Rc = Rc * max(1.0, len(q) / a.rate_cap)
                 if k < 0:                                 #a new satellite: give it its states
                     k = ins.slot(s_, B[i, 0], True)
                     o = NB + 2 * k
                     H[0, o], H[0, o + 1] = 1.0, rate_i[s_]
-                    Rc = R
+                    Rc = R * (max(1.0, len(sat_recent[s_]) / a.rate_cap) if a.rate_cap > 0 else 1.0)
                 ins.slot_heard[k] = B[i, 0]
+                fused_at[s_] = B[i, 0]
                 ins.update(H, np.array([yv]), Rc)
                 stats["fused"] += 1
                 recent.append(1)
                 assoc.append((B[i, 0], int(norad[s_]), ch_))
-        if r[0] >= t_off and anchor is None:
+        if r[0] >= t_loss and anchor is None:
             anchor = (ins.clk, float(r[7]))
         if anchor is not None and a.clk_temp > 0 and r[0] >= next_tc:
             next_tc += 1.0
@@ -591,8 +639,8 @@ def main():
             out.append((r[0], math.degrees(ins.lat), math.degrees(ins.lon), ins.h,
                         math.sqrt(P[0, 0] + P[1, 1]), ins.clk, ins.v[0], ins.v[1], ins.v[2],
                         stats["fused"], float(np.linalg.norm(r[1:4])), math.sqrt(P[2, 2])))
-    print("bursts after wheels-off: fused %d, gated %d, ambiguous %d, widened %d times, zero-velocity %d" % (
-        stats["fused"], stats["gated"], stats["amb"], stats.get("widened", 0), stats.get("zupt", 0)))
+    print("bursts after wheels-off: fused %d, gated %d, ambiguous %d, widened %d+%d times, zero-velocity %d, IMU gaps bridged %d" % (
+        stats["fused"], stats["gated"], stats["amb"], stats.get("widened", 0), stats.get("sat_widened", 0), stats.get("zupt", 0), stats.get("gaps", 0)))
     if qs_log:
         q_ = np.array(qs_log)
         print("adaptive motion noise: median x%.1f, 95%% x%.1f, max x%.1f" % (np.median(q_), np.percentile(q_, 95), q_.max()))
@@ -602,7 +650,7 @@ def main():
     dn = np.radians(o[:, 1] - lat) * 6371000.0
     de = np.radians(o[:, 2] - lon) * 6371000.0 * np.cos(np.radians(lat))
     err = np.hypot(dn, de)
-    mins = (o[:, 0] - t_off) / 60.0
+    mins = (o[:, 0] - t_loss) / 60.0
     for lo, hi in ((0, 5), (5, 15), (15, 30), (30, 45), (45, 60), (60, 90), (90, 200)):
         m = ok & (mins >= lo) & (mins < hi)
         if m.sum() > 10:

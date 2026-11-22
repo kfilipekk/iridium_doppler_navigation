@@ -145,7 +145,10 @@ def one_file(args):
 
 
 def run_dsp(out_path, t_s0, fno):
-    res = subprocess.run([DSP_HOST, out_path], capture_output=True, text=True)
+    #SOOP_DSP_LO (Hz) centres the DSP elsewhere than the Ring Alert, e.g. -83333 for the two
+    #simplex channels 125-167 kHz above it; the workers are separate processes, so not an option
+    lo = os.environ.get("SOOP_DSP_LO")
+    res = subprocess.run([DSP_HOST, out_path] + (["--lo", lo] if lo else []), capture_output=True, text=True)
     os.remove(out_path)
     rows = list(csv.DictReader(res.stdout.splitlines()))
     for row in rows:
