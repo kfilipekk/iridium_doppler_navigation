@@ -1447,7 +1447,7 @@ on its pigtail, GPS denied in software for 30 and 52 minutes. All of it is in
 \file{00000034.BIN}, and \file{tools/soop\_replay.py} runs that log through the navigation
 again on the host, with one setting changed at a time.
 
-\textbf{What had to be fixed first} (commit \file{ef97050}). The H743 rev V halves the ADC's
+\textbf{What had to be fixed first} (commit \file{685ce7e}). The H743 rev V halves the ADC's
 32\,MHz clock, so 16.5 + 8.5 cycles missed every other trigger: 250\,kSPS, every frequency read
 double, nothing matched a satellite. The boot message \emph{SoOP: I/Q at N kSPS} now says if
 the rate is off; check it before \file{swap\_iq}, which looked like the fix and was not. And
@@ -1478,7 +1478,7 @@ The TCXO moved $+19$\,Hz/\degC{} at the carrier as the board warmed itself from 
 
 \textbf{CPU.} \file{SOS.CPU} is wall time inside the DSP, so it counts the flight code that
 pre-empts the SoOP thread; \file{SOS.Ovr} (blocks dropped) is the figure to watch. At the
-Mound the DSP dropped 4--7\% of blocks; since \file{e3560f9} it drops none at the desk.
+Mound the DSP dropped 4--7\% of blocks; since \file{985799d} it drops none at the desk.
 
 \textbf{Running a session.} \cmd{tools/soop\_session.py OUT.csv PLAN} records both receivers
 and denies GPS on a plan (\file{off:1800,on:300,...}); \cmd{tools/soop\_live.py OUT.csv}
