@@ -13,8 +13,8 @@ streaming (droppable) log message and the logger drops some under load - 2026-11
 says how many really went in each second; the unlogged ones are put beside that second's logged
 ones (drops come in runs, while the card stalls), or at its start. --swap exchanges I
 and Q first: Rev E's spectrum comes out mirrored about the LO (2026-11-20, every session so far),
-which hides Ring Alert from the DSP. Block-numbered files (.iq4b/.i16b, firmware since
-8c0988e) carry their own timeline and are already the right way up unless SOW says otherwise:
+which hides Ring Alert from the DSP. Block-numbered files (.iq4b/.i16b, firmware from
+2026-11-20 on) carry their own timeline and are already the right way up unless SOW says otherwise:
 leave --swap off for them. The csv adds t (board s) and the file number to dsp_host's.
 """
 import argparse

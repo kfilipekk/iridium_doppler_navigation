@@ -9,14 +9,43 @@ A 46.5 × 47.2 mm, 6-layer STM32H743 flight controller that navigates without GP
 ![The assembled board, powered over USB](docs/img/board-photo.jpg)
 ![Board Top](docs/img/board-top.png)
 ![Board Bottom](docs/img/board-bottom.png)
-![Layout](docs/img/layout.png)
 
 </div>
+
+## Results
+
+### Castle Mound, Cambridge (16 Nov 2026)
+First session under the real sky: the board on a tripod with the HC610 antenna, GPS denied in software for 30 and 52 minutes. In 1 h 42 min it heard 17,106 bursts and fused 11,383. Each S-curve is a satellite passing over: dots are measured bursts, lines are the Doppler predicted from its orbit.
+
+![Iridium bursts on Castle Mound by Doppler shift over time](docs/img/bursts-castle-mound.jpg)
+
+Started 3 km off with no GPS and left at rest, Iridium alone settles to 50-130 m median error in replay.
+
+### Two flights (18-19 Nov 2026)
+On Stansted → Bremen and Hamburg → Gatwick the board was in my hand luggage at the window, logging the radio, IMU and cabin pressure, with a u-blox GPS logged as truth. I replayed the logs afterwards with GPS cut at wheels-off: the IMU corrected by Iridium Doppler, and the cabin barometer for height.
+
+![Stansted to Bremen replayed: the board's track without GPS against the u-blox](docs/img/flight-stansted-bremen.jpg)
+
+| Median error over 8 filter settings | Cruise (15-45 min) | Descent (45-75 min) |
+|---|---|---|
+| FR3634 Stansted → Bremen | 2.8-3.0 km | 3.7-6.0 km |
+| EZY8636 Hamburg → Gatwick | 3.5-3.9 km | 3.2-3.4 km |
+| The same IMU without Iridium | over 1,000 km | |
+
+None of the 16 runs diverged. The orbits are Space-Track elements from before take-off.
+
+<div align="center">
+
+![Position error after take-off on both flights](docs/img/error-after-takeoff.jpg)
+
+</div>
+
+These are replays of the logs. In the air the I/Q was mirrored (see Known Issues), so nothing decoded live. The firmware fixes that now; a live run is next.
 
 ## Features
 
 ### Iridium Navigation
-Optical flow and visual-inertial odometry drift without bound over long flights. Iridium NEXT satellites orbit at ~780 km and ~7.5 km/s and transmit continuously at 1616-1626.5 MHz, so the Doppler shift of their bursts gives an absolute position with bounded error (typically 100-200 m) that complements the faster inertial sensors.
+Optical flow and visual-inertial odometry drift without bound over long flights. Iridium NEXT satellites orbit at ~780 km and ~7.5 km/s, and their Ring Alert bursts at 1626.27 MHz arrive shifted by up to ±36 kHz. The shift depends on where you are, so enough bursts give a position, and unlike the IMU it doesn't drift.
 
 - **L-band Receiver** - MAX2112 direct-conversion tuner and OPA2374 baseband filter into the ADCs
 - **Antenna Feed** - MMCX port with a current-limited 5 V feed for the active antenna, reported as open, ok or short
@@ -30,7 +59,7 @@ Optical flow and visual-inertial odometry drift without bound over long flights.
 | IMUs | ICM-45686 (SPI1) and ICM-42605 (SPI4) on a separate analogue 3.3 V rail, shared with the tuner |
 | Barometer | MS5611 on I2C2 |
 | Storage | W25Q128 flash for the orbit catalogue, microSD over SDIO |
-| Power | 3S-5S input, TVS and reverse-polarity protection, two 3 A LMR33630 bucks, run to 1.6 A (system) and 2.1 A (payload) by the inductors' rms ratings; L2/L5 saturate at 2.4/2.5 A, below the IC's 4.2 A current limit, so a hard short on a 5 V rail saturates the inductor first and three 3.3 V LDOs |
+| Power | 3S-5S input with TVS and reverse-polarity protection, two LMR33630 bucks (1.6 A system, 2.1 A payload) and three 3.3 V LDOs |
 | Connectors | Latching JST-GH on every cable port, two servo headers, MMCX, USB-C, TC2030 SWD pads |
 | Protection | ESD clamp on every cable-facing signal, series resistors on the motor, telemetry, current, lidar and servo lines |
 
@@ -54,15 +83,22 @@ B.Cu:   IMUs, baro, both crystals, CAN, microSD, the underside connectors
 | IMUs | ICM-45686 + ICM-42605 | ICM-42688-P | ICM-42688-P + ICM-42605 | ICM-42688-P + BMI088 |
 | Input | 3-5S | 3-6S | 2-8S | power module |
 | Port ESD | every cable signal | none stated | none stated | none stated |
-| Position without GNSS | Iridium Doppler, 100-200 m | none | none | none |
+| Position without GNSS | Iridium Doppler | none | none | none |
 
 It has no OSD and no 9-12 V video rail, and it takes 5S at most.
+
+## Known Issues (Rev E)
+
+- **I/Q mirrored.** The I and Q channels arrive swapped, so the receiver heard every burst's mirror image, about 25 dB down. The firmware now turns the spectrum the right way up from Ring Alert decodes (`swap_iq` in `soop.cfg` forces it).
+- **RF line impedance.** The board was ordered on JLCPCB's default stackup, which puts the antenna line near 67 Ω rather than 50 Ω.
+- **No PPS line.** ArduPilot stamps u-blox fixes when the message arrives, so `gps_lag_s` corrects the time tag. An optional PPS input on TP3 is wired in firmware but untested.
+- **Channel 4 unused.** The channel at 1626.4375 MHz carries about 55% more bursts but sits outside the DSP's ±62.5 kHz window; using it live needs a second window.
 
 ## Getting Started
 
 ### Prerequisites
 - **KiCad 9** to open the board and schematic
-- **Python 3** and **ngspice** for the circuit simulations
+- **Python 3** with numpy and sgp4, and **ngspice** for the circuit simulations
 - **ArduPilot toolchain** for the firmware (`tools/build_firmware.sh` pins Copter-4.7.0)
 
 ### Building
@@ -99,8 +135,19 @@ python3 tools/fab.py bundle         # gerbers, BOM, CPL and the order sheet, int
 ```
 `--help` on any of them lists the rest.
 
+### Field Sessions and Replays
+```bash
+python3 tools/soop_plan.py 52.212 0.115           # rank the next hours by satellite geometry
+python3 tools/soop_session.py OUT.csv off:1800,on:300   # record both receivers, deny GPS on a plan
+python3 tools/soop_live.py OUT.csv                # watch it in the browser
+python3 tools/soop_replay.py LOG.BIN TLE --static # run a log through the navigation again
+python3 tools/soop_extract.py LOG.BIN LOG.npz     # a flight log to numpy
+python3 tools/soop_ins.py LOG.npz TLE BURSTS.csv TRUTH.npz --out FIXES.csv
+python3 tools/soop_flightmap.py --flight "LABEL|LOG.npz|FIXES.csv" --basemap DIR map.html
+```
+
 ### Ordering
-The JLCPCB files are in `fab/`: the Gerber and drill bundle, BOM, pick-and-place and schematic PDF. Order 6 layers, 1 oz copper inside and out, ENIG, epoxy-filled and capped vias, and assembly on both sides.
+The JLCPCB files are in `fab/`: the Gerber and drill bundle, BOM, pick-and-place and schematic PDF. Order 6 layers, 1 oz copper inside and out, ENIG, epoxy-filled and capped vias, and assembly on both sides. Name a controlled-impedance stackup if you want the antenna line at 50 Ω.
 
 ## Repository Structure
 
@@ -109,28 +156,17 @@ The JLCPCB files are in `fab/`: the Gerber and drill bundle, BOM, pick-and-place
 ├── NAVCORE-SoOP.kicad_sch   # Schematic, generated from tools/design.py
 ├── fab/                     # JLCPCB order files
 ├── firmware/                # ArduPilot hwdef, the SoOP backend and the on-board navigation
-├── tools/                   # Design model, schematic and hwdef generators, board checks
+├── tools/                   # Design model, board checks, and the soop_* field and replay tools
 ├── sim/                     # ngspice simulations of the analogue blocks
+├── sitl/tle/                # Iridium orbital elements for the host tools
 ├── cad/                     # OpenSCAD airframe, printed mounts and renders
 └── libraries/               # Footprint and symbol libraries
 ```
 
-## Applications
+## Next
 
-I made this project to explore:
-- Navigation from signals of opportunity instead of GPS
-- Six-layer mixed-signal PCB design with an RF front end
-- ArduPilot drivers and EKF integration
-- Simulating the analogue blocks before ordering
-
-## Future Plans
-
-- Bring up Rev E and bench-test the Iridium receive chain with the HC610 antenna
-- A downward radar for velocity, which sets how well the Iridium fix holds
-- Later: a third IMU, 6S input and a 9-12 V video rail
-
-<div align="center">
-
-Developed by [kfilipekk](https://github.com/kfilipekk)
-
-</div>
+- A live run on the current firmware at Castle Mound
+- A second DSP window so channel 4 is used live
+- Per-satellite transmitter offsets and fresher orbits, which set the static floor more than the DSP does
+- A downward radar for velocity, then flying it on the drone
+- Writing up the airliner results

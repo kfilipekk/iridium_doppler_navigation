@@ -52,7 +52,7 @@ def main():
                         f"swap {int(sow[-1, 1])}, locked {locked.mean() * 100:.0f}% of checks, {flips} flips, "
                         f"{frac * 100:.0f}% of strong bursts decoded"))
     else:
-        res.append(line(None, "orientation", "no SOW records (firmware before 8c0988e?)"))
+        res.append(line(None, "orientation", "no SOW records (firmware older than the I/Q orientation check?)"))
     rate = len(sor) / max(span_min, 1e-9)
     res.append(line(rate > 5, "decodes", f"{len(sor)} Ring Alerts decoded, {rate:.1f}/min"))
     if len(sos):
