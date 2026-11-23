@@ -6,6 +6,7 @@ A 46.5 × 47.2 mm, 6-layer STM32H743 flight controller that navigates without GP
 
 <div align="center">
 
+![The assembled board, powered over USB](docs/img/board-photo.jpg)
 ![Board Top](docs/img/board-top.png)
 ![Board Bottom](docs/img/board-bottom.png)
 ![Layout](docs/img/layout.png)
